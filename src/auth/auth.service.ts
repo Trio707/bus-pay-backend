@@ -10,10 +10,19 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { UserRole, UserStatus, type User } from '../generated/prisma';
+import { Prisma, UserRole, UserStatus, type User } from '../generated/prisma';
 import * as bcrypt from 'bcrypt';
 
 import { PrismaService } from '../prisma/prisma.service';
+import { SmsDispatcherService } from '../sms/sms-dispatcher.service';
+import { SmsService } from '../sms/sms.service';
+import { wakalaAccountSms } from '../sms/sms-copy';
+import { ALL_PERMISSION_CODES } from './permissions';
+import { assertNidaAvailable, withConductorNidaLock } from './nida-policy';
+import {
+  assertStrongPassword,
+  generateTemporaryPassword,
+} from './password-policy';
 import { AgentForgotPasswordDto } from './dto/agent-forgot-password.dto';
 import { AgentLoginDto } from './dto/agent-login.dto';
 import { AgentRegisterDto } from './dto/agent-register.dto';
@@ -27,6 +36,7 @@ import { RegisterDto } from './dto/register.dto';
 import { ResetPinDto } from './dto/reset-pin.dto';
 import { normalizeEmail } from './email';
 import {
+  normalizeName,
   normalizeNida,
   normalizePhone,
   phoneLookupValues,
@@ -41,7 +51,7 @@ const RESET_CODE_MS = 10 * 60 * 1000;
 const MAX_RESET_ATTEMPTS = 5;
 const BAD_CREDENTIALS = 'Incorrect username or password';
 
-type ApiRole = 'conductor' | 'agent' | 'admin';
+type ApiRole = 'conductor' | 'agent' | 'admin' | 'master_agent';
 
 @Injectable()
 export class AuthService {
@@ -54,6 +64,8 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly sms: SmsService,
+    private readonly smsDispatcher: SmsDispatcherService,
   ) {}
 
   async registerConductor(dto: RegisterDto) {
@@ -75,12 +87,22 @@ export class AuthService {
   }
 
   async createWakala(dto: CreateWakalaDto, actor?: User) {
+    if (
+      actor?.role &&
+      actor.role !== UserRole.ADMIN &&
+      actor.role !== UserRole.MASTER_AGENT
+    ) {
+      throw new ForbiddenException();
+    }
 
-    const firstName = dto.firstName.trim();
-    const lastName = dto.lastName.trim();
+    const firstName = normalizeName(dto.firstName);
+    const lastName = normalizeName(dto.lastName);
     const phone = normalizePhone(dto.phone);
     const nida = normalizeNida(dto.nida);
     const email = normalizeEmail(dto.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('Use a valid email');
+    }
 
     const existingPhone = await this.prisma.user.findFirst({
       where: { phone: { in: phoneLookupValues(phone) } },
@@ -89,15 +111,11 @@ export class AuthService {
       throw new ConflictException('Phone number is already registered');
     }
 
-    const existingNida = await this.prisma.user.findUnique({
-      where: { nida },
-    });
-    if (existingNida) {
-      throw new ConflictException('NIDA is already registered');
-    }
+    await assertNidaAvailable(this.prisma, nida, UserRole.AGENT);
 
     const existingEmail = await this.prisma.user.findFirst({
       where: {
+        role: UserRole.AGENT,
         email: {
           equals: email,
           mode: 'insensitive',
@@ -108,7 +126,17 @@ export class AuthService {
       throw new ConflictException('Email is already registered');
     }
 
-    const passwordHash = await bcrypt.hash(dto.password, 12);
+    const issuedByAdmin = Boolean(actor);
+    const temporaryPassword = issuedByAdmin
+      ? generateTemporaryPassword()
+      : dto.password;
+    if (!temporaryPassword) {
+      throw new BadRequestException('Password is required');
+    }
+    if (!issuedByAdmin) {
+      assertStrongPassword(temporaryPassword, { phone, nida });
+    }
+    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
     const username = await this.uniqueUsername(UserRole.AGENT);
 
     const user = await this.prisma.user.create({
@@ -122,6 +150,7 @@ export class AuthService {
         email,
         tillNumber: this.formatTill(nida),
         role: UserRole.AGENT,
+        mustChangePassword: issuedByAdmin,
       },
     });
 
@@ -135,9 +164,33 @@ export class AuthService {
           metadata: {
             role: 'agent',
             username: user.username,
+            mustChangePassword: true,
           },
         },
       });
+      await this.prisma.auditLog.create({
+        data: {
+          actorUserId: actor.id,
+          action: 'PASSWORD_ISSUED',
+          entityType: 'User',
+          entityId: user.id,
+          metadata: { channel: 'sms-notice' },
+        },
+      });
+      try {
+        await this.sms.enqueue(
+          phone,
+          'WAKALA_ACCOUNT_CREDENTIALS',
+          wakalaAccountSms(user.username),
+        );
+        void this.smsDispatcher.flush();
+      } catch (error) {
+        this.logger.warn(
+          `Wakala credential SMS was not queued for ${user.id}: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+      }
     }
 
     return {
@@ -157,8 +210,8 @@ export class AuthService {
       throw new BadRequestException('PINs do not match');
     }
 
-    const firstName = dto.firstName.trim();
-    const lastName = dto.lastName.trim();
+    const firstName = normalizeName(dto.firstName);
+    const lastName = normalizeName(dto.lastName);
     const phone = normalizePhone(dto.phone);
     const nida = normalizeNida(dto.nida);
 
@@ -169,30 +222,43 @@ export class AuthService {
       throw new ConflictException('Phone number is already registered');
     }
 
-    const existingNida = await this.prisma.user.findUnique({
-      where: { nida },
-    });
-    if (existingNida) {
-      throw new ConflictException('NIDA is already registered');
-    }
-
     const passwordHash = await bcrypt.hash(dto.pin, 12);
     const tillNumber =
       role === UserRole.AGENT ? this.formatTill(nida) : null;
-    const username = await this.uniqueUsername(role);
 
-    const user = await this.prisma.user.create({
-      data: {
-        username,
-        passwordHash,
-        firstName,
-        lastName,
-        phone,
-        nida,
-        tillNumber,
-        role,
-      },
-    });
+    const user =
+      role === UserRole.CONDUCTOR
+        ? await withConductorNidaLock(this.prisma, nida, async (tx, normalized) => {
+            const username = await this.uniqueUsername(role, tx);
+            return tx.user.create({
+              data: {
+                username,
+                passwordHash,
+                firstName,
+                lastName,
+                phone,
+                nida: normalized,
+                tillNumber,
+                role,
+              },
+            });
+          })
+        : await (async () => {
+            await assertNidaAvailable(this.prisma, nida, role);
+            const username = await this.uniqueUsername(role);
+            return this.prisma.user.create({
+              data: {
+                username,
+                passwordHash,
+                firstName,
+                lastName,
+                phone,
+                nida,
+                tillNumber,
+                role,
+              },
+            });
+          })();
 
     if (role === UserRole.CONDUCTOR) {
       await this.ensureConductorTerminal(user.id);
@@ -360,7 +426,7 @@ export class AuthService {
     const email = normalizeEmail(dto.email);
     const user = await this.prisma.user.findFirst({
       where: {
-        role: UserRole.ADMIN,
+        role: { in: [UserRole.ADMIN, UserRole.MASTER_AGENT] },
         email: {
           equals: email,
           mode: 'insensitive',
@@ -393,7 +459,34 @@ export class AuthService {
       );
     }
 
+    if (user.role === UserRole.MASTER_AGENT && !user.credentialEmailSentAt) {
+      throw new UnauthorizedException('Onboarding email has not been sent');
+    }
+
     return this.issueSession(user);
+  }
+
+  async dashboardSession(user: User) {
+    if (user.role !== UserRole.ADMIN && user.role !== UserRole.MASTER_AGENT) {
+      throw new ForbiddenException();
+    }
+    if (user.status !== UserStatus.ACTIVE) {
+      throw new UnauthorizedException(BAD_CREDENTIALS);
+    }
+    return {
+      user: {
+        id: user.id,
+        username: user.username,
+        firstName: normalizeName(user.firstName),
+        lastName: normalizeName(user.lastName),
+        phone: user.phone,
+        email: user.email,
+        role: this.toApiRole(user.role),
+        tillNumber: user.tillNumber,
+        mustChangePassword: Boolean(user.mustChangePassword),
+        permissions: await this.permissionCodes(user),
+      },
+    };
   }
 
   async forgotAgentPassword(dto: AgentForgotPasswordDto) {
@@ -450,6 +543,11 @@ export class AuthService {
       throw new UnauthorizedException('Account not found');
     }
 
+    assertStrongPassword(dto.password, {
+      phone: user.phone,
+      nida: user.nida,
+      username: user.username,
+    });
     const passwordHash = await bcrypt.hash(dto.password, 12);
     await this.replaceCredential(user.id, passwordHash);
     this.resetCodes.delete(key);
@@ -478,9 +576,64 @@ export class AuthService {
     if (dto.password === dto.currentPassword) {
       throw new BadRequestException('New password must be different');
     }
+    assertStrongPassword(dto.password, {
+      phone: user.phone,
+      nida: user.nida,
+      username: user.username,
+    });
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
     await this.replaceCredential(user.id, passwordHash);
+    await this.prisma.auditLog.create({
+      data: {
+        actorUserId: user.id,
+        action: 'PASSWORD_CHANGED',
+        entityType: 'User',
+        entityId: user.id,
+        metadata: { role: 'agent' },
+      },
+    });
+    return { message: 'Password changed successfully' };
+  }
+
+  async changeDashboardPassword(user: User, dto: ChangePasswordDto) {
+    if (user.role !== UserRole.ADMIN && user.role !== UserRole.MASTER_AGENT) {
+      throw new ForbiddenException();
+    }
+    if (dto.password !== dto.confirmPassword) {
+      throw new BadRequestException('Passwords do not match');
+    }
+
+    const lockout = this.lockoutOf(user);
+    if (lockout.lockedUntil && lockout.lockedUntil.getTime() > Date.now()) {
+      this.throwLocked(lockout.lockedUntil);
+    }
+
+    const matches = await bcrypt.compare(dto.currentPassword, user.passwordHash);
+    if (!matches) {
+      await this.registerFailedAttempt(user.id, lockout.failedLoginAttempts, 'credentials');
+    }
+
+    if (dto.password === dto.currentPassword) {
+      throw new BadRequestException('New password must be different');
+    }
+    assertStrongPassword(dto.password, {
+      phone: user.phone,
+      nida: user.nida,
+      username: user.username,
+    });
+
+    const passwordHash = await bcrypt.hash(dto.password, 12);
+    await this.replaceCredential(user.id, passwordHash);
+    await this.prisma.auditLog.create({
+      data: {
+        actorUserId: user.id,
+        action: 'PASSWORD_CHANGED',
+        entityType: 'User',
+        entityId: user.id,
+        metadata: { role: this.toApiRole(user.role) },
+      },
+    });
     return { message: 'Password changed successfully' };
   }
 
@@ -616,6 +769,7 @@ export class AuthService {
         passwordHash,
         failedLoginAttempts: 0,
         lockedUntil: null,
+        mustChangePassword: false,
       },
     });
   }
@@ -629,6 +783,9 @@ export class AuthService {
     email: string | null;
     role: UserRole;
     tillNumber: string | null;
+    mustChangePassword?: boolean;
+    profilePhotoKey?: string | null;
+    profilePhotoUpdatedAt?: Date | null;
   }) {
     await this.setLockout(user.id, 0, null);
     if (user.role === UserRole.CONDUCTOR) {
@@ -649,18 +806,39 @@ export class AuthService {
       sv: refreshed.sessionVersion,
     });
 
+    if (user.role === UserRole.AGENT) {
+      await this.prisma.auditLog.create({
+        data: {
+          actorUserId: user.id,
+          action: 'USER_LOGIN',
+          entityType: 'User',
+          entityId: user.id,
+          metadata: {
+            role: 'agent',
+            mustChangePassword: Boolean(user.mustChangePassword),
+          },
+        },
+      });
+    }
+
     return {
       message: 'Login successful',
       accessToken,
       user: {
         id: user.id,
         username: user.username,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        firstName: normalizeName(user.firstName),
+        lastName: normalizeName(user.lastName),
         phone: user.phone,
         email: user.email,
         role: this.toApiRole(user.role),
         tillNumber: user.tillNumber,
+        mustChangePassword: Boolean(user.mustChangePassword),
+        permissions: await this.permissionCodes(user),
+        profilePhotoUrl: user.profilePhotoKey ? '/auth/profile/photo' : null,
+        profilePhotoUpdatedAt: user.profilePhotoUpdatedAt
+          ? user.profilePhotoUpdatedAt.toISOString()
+          : null,
       },
     };
   }
@@ -744,8 +922,22 @@ export class AuthService {
 
   private toApiRole(role: UserRole): ApiRole {
     if (role === UserRole.ADMIN) return 'admin';
+    if (role === UserRole.MASTER_AGENT) return 'master_agent';
     if (role === UserRole.AGENT) return 'agent';
     return 'conductor';
+  }
+
+  private async permissionCodes(user: {
+    id: string;
+    role: UserRole;
+  }): Promise<string[]> {
+    if (user.role === UserRole.ADMIN) return [...ALL_PERMISSION_CODES];
+    if (user.role !== UserRole.MASTER_AGENT) return [];
+    const rows = await this.prisma.userPermission.findMany({
+      where: { userId: user.id },
+      select: { permissionCode: true },
+    });
+    return rows.map((row) => row.permissionCode);
   }
 
   private formatTill(nida: string): string {
@@ -755,7 +947,10 @@ export class AuthService {
     return `${lastEight.slice(0, 4)}-${lastEight.slice(4)}`;
   }
 
-  private async uniqueUsername(role: UserRole): Promise<string> {
+  private async uniqueUsername(
+    role: UserRole,
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<string> {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const code = String(randomInt(100000, 1000000));
       const username =
@@ -763,8 +958,10 @@ export class AuthService {
           ? `Bp-c${code}bus`
           : role === UserRole.ADMIN
             ? `Bp-x${code}admin`
-            : `Bp-a${code}agent`;
-      const taken = await this.prisma.user.findFirst({
+            : role === UserRole.MASTER_AGENT
+              ? `Bp-m${code}lead`
+              : `Bp-a${code}agent`;
+      const taken = await db.user.findFirst({
         where: {
           username: {
             equals: username,

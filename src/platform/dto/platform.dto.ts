@@ -4,6 +4,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  MaxLength,
   Matches,
   Min,
   ValidateIf,
@@ -135,6 +136,14 @@ export class TapPaymentDto {
   @IsOptional()
   @IsString()
   serviceType?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  @Matches(/^[A-Za-z0-9_-]{8,80}$/, {
+    message: 'idempotencyKey must be 8-80 letters, digits, _ or -',
+  })
+  idempotencyKey?: string;
 }
 
 export class TopUpDto {
@@ -164,6 +173,14 @@ export class TopUpDto {
   @IsInt()
   @Min(1)
   amount: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  @Matches(/^[A-Za-z0-9_-]{8,80}$/, {
+    message: 'idempotencyKey must be 8-80 letters, digits, _ or -',
+  })
+  idempotencyKey?: string;
 }
 
 /** Conductor cash-out at a wakala till. */
@@ -176,6 +193,14 @@ export class ConductorWithdrawDto {
   @IsInt()
   @Min(1)
   amount: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  @Matches(/^[A-Za-z0-9_-]{8,80}$/, {
+    message: 'idempotencyKey must be 8-80 letters, digits, _ or -',
+  })
+  idempotencyKey?: string;
 }
 
 export class TillLookupDto {
@@ -222,4 +247,12 @@ export class RenewCardDto {
   @IsInt()
   @Min(0)
   initialLoad?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  @Matches(/^[A-Za-z0-9_-]{8,80}$/, {
+    message: 'idempotencyKey must be 8-80 letters, digits, _ or -',
+  })
+  idempotencyKey?: string;
 }

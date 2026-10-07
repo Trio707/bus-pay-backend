@@ -4,11 +4,13 @@ import {
   Get,
   Param,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { MustChangePasswordGuard } from '../auth/must-change-password.guard';
 import { Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { UserRole, type User } from '../generated/prisma';
@@ -26,7 +28,7 @@ import {
 import { PlatformService } from './platform.service';
 
 @Controller('platform')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(JwtAuthGuard, MustChangePasswordGuard, RolesGuard)
 export class PlatformController {
   constructor(private readonly platformService: PlatformService) {}
 
@@ -46,15 +48,15 @@ export class PlatformController {
   /** Recommended: names + cardNumber + nfcUid → activate wallet (no money). */
   @Post('cards/activate')
   @Roles(UserRole.AGENT)
-  activateCard(@Body() dto: ActivateCardDto) {
-    return this.platformService.activateCard(dto);
+  activateCard(@CurrentUser() user: User, @Body() dto: ActivateCardDto) {
+    return this.platformService.activateCard(dto, user);
   }
 
   /** One-shot or legacy: activate (+ optional initialLoad). */
   @Post('cards')
   @Roles(UserRole.AGENT)
-  issueCard(@Body() dto: IssueCardDto) {
-    return this.platformService.issueCard(dto);
+  issueCard(@CurrentUser() user: User, @Body() dto: IssueCardDto) {
+    return this.platformService.issueCard(dto, user);
   }
 
   @Get('cards/uid/:nfcUid')
@@ -68,8 +70,19 @@ export class PlatformController {
   }
 
   @Get('transactions')
-  getTransactions(@CurrentUser() user: User) {
-    return this.platformService.getTransactions(user);
+  getTransactions(
+    @CurrentUser() user: User,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('since') since?: string,
+    @Query('summary') summary?: string,
+  ) {
+    return this.platformService.getTransactions(user, {
+      limit,
+      cursor,
+      since,
+      summary,
+    });
   }
 
   @Post('cards/:serial/freeze')
@@ -90,10 +103,11 @@ export class PlatformController {
   @Post('cards/:serial/renew')
   @Roles(UserRole.AGENT)
   renewCard(
+    @CurrentUser() user: User,
     @Param('serial') serial: string,
     @Body() dto: RenewCardDto,
   ) {
-    return this.platformService.renewCard(serial, dto);
+    return this.platformService.renewCard(serial, dto, user);
   }
 
   @Post('payments/tap')
@@ -123,5 +137,21 @@ export class PlatformController {
   @Roles(UserRole.AGENT)
   topUp(@CurrentUser() user: User, @Body() dto: TopUpDto) {
     return this.platformService.topUp(user, dto);
+  }
+
+  @Get('float')
+  @Roles(UserRole.AGENT)
+  getFloat(@CurrentUser() user: User) {
+    return this.platformService.getFloat(user);
+  }
+
+  @Get('float/transactions')
+  @Roles(UserRole.AGENT)
+  listFloatTransactions(
+    @CurrentUser() user: User,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.platformService.listFloatTransactions(user, page, limit);
   }
 }

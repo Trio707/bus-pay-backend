@@ -1,7 +1,14 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { MustChangePasswordGuard } from '../auth/must-change-password.guard';
+import { PermissionGuard } from '../auth/permission.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { UserRole, UserStatus } from '../generated/prisma';
+import { FinancialReportService } from '../financial/financial-report.service';
+import { CompanyFinanceService } from '../financial/company-finance.service';
+import { OpeningBalanceService } from '../financial/opening-balance.service';
+import { ConductorPayoutService } from '../payout/conductor-payout.service';
+import { ProfilePhotoService } from '../profile-photo/profile-photo.service';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -53,11 +60,45 @@ describe('AdminController', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AdminController],
-      providers: [{ provide: AdminService, useValue: service }],
+      providers: [
+        { provide: AdminService, useValue: service },
+        {
+          provide: ConductorPayoutService,
+          useValue: { listForAdmin: jest.fn().mockResolvedValue({ payouts: [] }) },
+        },
+        {
+          provide: FinancialReportService,
+          useValue: {
+            accounts: jest.fn(),
+            ledger: jest.fn(),
+            revenue: jest.fn(),
+            expenses: jest.fn(),
+            profitability: jest.fn(),
+            wakalaCommissions: jest.fn(),
+            settleWakala: jest.fn(),
+          },
+        },
+        {
+          provide: OpeningBalanceService,
+          useValue: { reconciliation: jest.fn(), apply: jest.fn() },
+        },
+        {
+          provide: CompanyFinanceService,
+          useValue: { cashReconciliation: jest.fn().mockResolvedValue([]) },
+        },
+        {
+          provide: ProfilePhotoService,
+          useValue: { readForAdmin: jest.fn() },
+        },
+      ],
     })
       .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(RolesGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(PermissionGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(MustChangePasswordGuard)
       .useValue({ canActivate: () => true })
       .compile();
 
@@ -69,8 +110,8 @@ describe('AdminController', () => {
   });
 
   it('lists users', async () => {
-    const result = await controller.listUsers({ page: 1, limit: 50 });
-    expect(service.listUsers).toHaveBeenCalledWith({ page: 1, limit: 50 });
+    const result = await controller.listUsers(adminUser, { page: 1, limit: 50 });
+    expect(service.listUsers).toHaveBeenCalledWith({ page: 1, limit: 50 }, adminUser);
     expect(result.total).toBe(1);
   });
 

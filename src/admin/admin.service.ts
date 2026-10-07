@@ -2,8 +2,11 @@ import { randomInt } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
+  ServiceUnavailableException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import {
@@ -18,17 +21,32 @@ import {
   TransactionStatus,
   UserRole,
   UserStatus,
+  WakalaFloatFundingChannel,
+  WakalaFloatTransactionType,
   WalletStatus,
   WithdrawalStatus,
   type User,
 } from '../generated/prisma';
+import { normalizeNfcUid, sameNfcUid } from '../platform/nfc-uid';
+import { WakalaFloatService } from '../platform/wakala-float.service';
+import { AuthorizationService } from '../auth/authorization.service';
+import { normalizeEmail } from '../auth/email';
 import {
+  normalizeName,
   normalizeNida,
   normalizePhone,
+  personName,
   phoneLookupValues,
+  presentNames,
 } from '../auth/identity';
+import { assertNidaAvailable, withConductorNidaLock } from '../auth/nida-policy';
+import { EmailService } from '../email/email.service';
+import { generateTemporaryPassword } from '../auth/password-policy';
 import { PrismaService } from '../prisma/prisma.service';
+import { SmsDispatcherService } from '../sms/sms-dispatcher.service';
 import { SmsService } from '../sms/sms.service';
+import { floatFundingSms, refundSms, renewalSms } from '../sms/sms-copy';
+import { queuePaidWithdrawalSms } from '../sms/withdrawal-sms';
 import {
   AssignTerminalDto,
   BulkInventoryDto,
@@ -54,6 +72,9 @@ import {
   UpdateSettingsDto,
   UpdateUserStatusDto,
   WithdrawalDecisionDto,
+  FundWakalaFloatDto,
+  CreateMasterWakalaDto,
+  UpdateMasterWakalaDto,
 } from './dto/admin.dto';
 
 @Injectable()
@@ -61,7 +82,14 @@ export class AdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sms: SmsService,
-  ) {}
+    private readonly floats: WakalaFloatService,
+    @Optional() private readonly smsDispatcher?: SmsDispatcherService,
+    @Optional() private readonly email?: EmailService,
+  ) {
+    this.authz = new AuthorizationService(prisma);
+  }
+
+  private readonly authz: AuthorizationService;
 
   async overview() {
     const startOfDay = new Date();
@@ -118,7 +146,10 @@ export class AdminService {
     };
   }
 
-  async listUsers(query: ListUsersQueryDto) {
+  async listUsers(query: ListUsersQueryDto, actor?: User) {
+    if (actor) {
+      await this.authz.requireUserList(actor, query.role);
+    }
     const { skip, take, page, limit } = this.pageOf(query);
     const where: Prisma.UserWhereInput = {};
     if (query.role) where.role = query.role;
@@ -157,6 +188,9 @@ export class AdminService {
           lockedUntil: true,
           createdAt: true,
           updatedAt: true,
+          profilePhotoKey: true,
+          profilePhotoUpdatedAt: true,
+          wakalaFloat: { select: { balance: true } },
         },
       }),
     ]);
@@ -165,14 +199,19 @@ export class AdminService {
       page,
       limit,
       total,
-      users: users.map((u) => ({
-        ...u,
-        role: this.toApiRole(u.role),
-      })),
+      users: users.map(({ wakalaFloat, profilePhotoKey, ...u }) =>
+        presentNames({
+          ...u,
+          role: this.toApiRole(u.role),
+          hasProfilePhoto: Boolean(profilePhotoKey),
+          floatBalance:
+            u.role === UserRole.AGENT ? (wakalaFloat?.balance ?? 0) : null,
+        }),
+      ),
     };
   }
 
-  async getUser(id: string) {
+  async getUser(id: string, actor?: User) {
     const user = await this.prisma.user.findUnique({
       where: { id },
       select: {
@@ -198,17 +237,115 @@ export class AdminService {
             merchant: { select: { merchantCode: true, name: true } },
           },
         },
+        wakalaFloat: { select: { balance: true, updatedAt: true } },
       },
     });
     if (!user) {
       throw new NotFoundException('User not found');
     }
-    return { ...user, role: this.toApiRole(user.role) };
+    if (actor) {
+      await this.authz.requireUserRead(actor, user.role);
+    }
+    const { wakalaFloat, ...rest } = user;
+    return presentNames({
+      ...rest,
+      role: this.toApiRole(user.role),
+      floatBalance:
+        user.role === UserRole.AGENT ? (wakalaFloat?.balance ?? 0) : null,
+    });
+  }
+
+  async getWakalaFloat(agentUserId: string) {
+    const agent = await this.requireAgent(agentUserId);
+    const balance = await this.floats.getBalance(agent.id);
+    return {
+      agent: this.agentSummary(agent),
+      ...balance,
+    };
+  }
+
+  async listWakalaFloatTransactions(
+    agentUserId: string,
+    query: PaginationQueryDto,
+  ) {
+    const agent = await this.requireAgent(agentUserId);
+    const { page, limit } = this.pageOf(query);
+    const history = await this.floats.listTransactions(agent.id, page, limit);
+    return { agent: this.agentSummary(agent), ...history };
+  }
+
+  async fundWakalaFloat(
+    actor: User,
+    agentUserId: string,
+    dto: FundWakalaFloatDto,
+  ) {
+    if (actor.role !== UserRole.ADMIN) {
+      throw new ForbiddenException('Only admin can fund wakala float');
+    }
+    if (!Number.isInteger(dto.amount) || dto.amount < 1) {
+      throw new BadRequestException('Amount must be greater than 0');
+    }
+    const agent = await this.requireAgent(agentUserId);
+    const reason = dto.reason?.trim() || 'Admin float funding';
+    const requestedReference = dto.reference?.trim();
+
+    const posted = await this.prisma.$transaction(async (tx) => {
+      const reference =
+        requestedReference || (await this.floats.nextFundingReference(tx));
+      const row = await this.floats.record(tx, {
+        agentUserId: agent.id,
+        type: WakalaFloatTransactionType.FLOAT_FUNDING,
+        amount: dto.amount,
+        reference,
+        reason,
+        fundingChannel: WakalaFloatFundingChannel.ADMIN,
+      });
+      await tx.auditLog.create({
+        data: {
+          actorUserId: actor.id,
+          action: 'FLOAT_FUND',
+          entityType: 'WakalaFloat',
+          entityId: agent.id,
+          metadata: {
+            amount: dto.amount,
+            reference: row.reference,
+            reason,
+            balanceBefore: row.balanceBefore,
+            balanceAfter: row.balanceAfter,
+            fundingChannel: WakalaFloatFundingChannel.ADMIN,
+          },
+        },
+      });
+      return row;
+    });
+
+    if (!posted.alreadyPosted) {
+      try {
+        await this.sms.enqueue(
+          agent.phone,
+          'WAKALA_FLOAT_FUNDING',
+          floatFundingSms(dto.amount, posted.balanceAfter, posted.reference),
+        );
+        void this.smsDispatcher?.flush();
+      } catch {
+        // The funding row is already committed. Delivery retries from the outbox.
+      }
+    }
+
+    return {
+      message: 'Wakala float funded',
+      agent: this.agentSummary(agent),
+      amount: dto.amount,
+      reference: posted.reference,
+      balanceBefore: posted.balanceBefore,
+      balanceAfter: posted.balanceAfter,
+      currency: 'TZS',
+    };
   }
 
   async createConductor(actor: User, dto: CreateConductorDto) {
-    const firstName = dto.firstName.trim();
-    const lastName = dto.lastName.trim();
+    const firstName = normalizeName(dto.firstName);
+    const lastName = normalizeName(dto.lastName);
     const phone = normalizePhone(dto.phone);
     const nida = normalizeNida(dto.nida);
 
@@ -219,26 +356,26 @@ export class AdminService {
       throw new ConflictException('Phone number is already registered');
     }
 
-    const existingNida = await this.prisma.user.findUnique({ where: { nida } });
-    if (existingNida) {
-      throw new ConflictException('NIDA is already registered');
-    }
-
     const passwordHash = await bcrypt.hash(dto.pin, 12);
-    const username = await this.uniqueConductorUsername();
-
-    const user = await this.prisma.user.create({
-      data: {
-        username,
-        passwordHash,
-        firstName,
-        lastName,
-        phone,
-        nida,
-        role: UserRole.CONDUCTOR,
-        status: UserStatus.ACTIVE,
+    const user = await withConductorNidaLock(
+      this.prisma,
+      nida,
+      async (tx, normalized) => {
+        const username = await this.uniqueConductorUsername(tx);
+        return tx.user.create({
+          data: {
+            username,
+            passwordHash,
+            firstName,
+            lastName,
+            phone,
+            nida: normalized,
+            role: UserRole.CONDUCTOR,
+            status: UserStatus.ACTIVE,
+          },
+        });
       },
-    });
+    );
 
     await this.audit(actor.id, 'USER_CREATE', 'User', user.id, {
       role: 'conductor',
@@ -265,6 +402,7 @@ export class AdminService {
     if (!user) {
       throw new NotFoundException('User not found');
     }
+    await this.authz.requireStatusChange(actor, user, dto.status);
     if (user.role === UserRole.ADMIN && dto.status !== UserStatus.ACTIVE) {
       throw new BadRequestException('Cannot suspend or deactivate an admin');
     }
@@ -313,7 +451,7 @@ export class AdminService {
       }),
     ]);
 
-    return {
+    return presentNames({
       page,
       limit,
       total,
@@ -334,7 +472,7 @@ export class AdminService {
             }
           : null,
       })),
-    };
+    });
   }
 
   async assignTerminal(
@@ -380,12 +518,12 @@ export class AdminService {
       previousOwnerUserId: terminal.ownerUserId,
     });
 
-    return {
+    return presentNames({
       id: updated.id,
       terminalCode: updated.terminalCode,
       merchant: updated.merchant,
       conductor: updated.owner,
-    };
+    });
   }
 
   async listCards(query: ListCardsQueryDto) {
@@ -419,6 +557,13 @@ export class AdminService {
         take,
         orderBy: { issuedAt: 'desc' },
         include: {
+          replaces: {
+            select: {
+              nfcUid: true,
+              status: true,
+              serialNumber: true,
+            },
+          },
           wallet: {
             select: {
               id: true,
@@ -438,12 +583,12 @@ export class AdminService {
       }),
     ]);
 
-    return { page, limit, total, cards };
+    return presentNames({ page, limit, total, cards });
   }
 
   async getCard(serial: string) {
     const card = await this.findCardBySerial(serial);
-    return card;
+    return presentNames(card);
   }
 
   async freezeCard(actor: User, serial: string) {
@@ -485,23 +630,53 @@ export class AdminService {
   }
 
   async replaceCard(actor: User, oldSerial: string, dto: ReplaceCardDto) {
-    const oldCard = await this.findCardBySerial(oldSerial);
-    const serialNumber = dto.serialNumber?.trim().toUpperCase();
-    const nfcUid = dto.nfcUid?.replace(/\s+/g, '').toUpperCase() || undefined;
-
-    if (serialNumber) {
-      const taken = await this.prisma.card.findUnique({
-        where: { serialNumber },
-      });
-      if (taken) {
-        throw new ConflictException('Card serial is already issued');
-      }
+    const nfcUid = normalizeNfcUid(dto.nfcUid);
+    if (!nfcUid) {
+      throw new BadRequestException('nfcUid is required from the NFC scanner');
     }
 
+    const oldCard = await this.findCardBySerial(oldSerial);
+    const requested = dto.serialNumber?.trim().toUpperCase();
+    if (requested && requested !== oldCard.serialNumber) {
+      throw new BadRequestException(
+        'Replacement keeps the existing card number',
+      );
+    }
+    if (sameNfcUid(oldCard.nfcUid, nfcUid)) {
+      throw new BadRequestException('Scan the new physical card');
+    }
+
+    const taken = await this.prisma.card.findFirst({
+      where: { nfcUid: { in: [nfcUid, nfcUid.replace(/:/g, '')] } },
+    });
+    if (taken && taken.id !== oldCard.id) {
+      throw new ConflictException('NFC UID is already issued');
+    }
+
+    const phone = oldCard.wallet.customer.phone;
+    const serialNumber = oldCard.serialNumber;
     const replacement = await this.prisma.$transaction(async (tx) => {
+      const claimable =
+        oldCard.status === CardStatus.ACTIVE ||
+        oldCard.status === CardStatus.FROZEN;
+      if (claimable) {
+        const claimed = await tx.card.updateMany({
+          where: {
+            id: oldCard.id,
+            status: { in: [CardStatus.ACTIVE, CardStatus.FROZEN] },
+          },
+          data: { status: CardStatus.LOST },
+        });
+        if (claimed.count !== 1) {
+          throw new ConflictException('Card was already replaced');
+        }
+      } else if (oldCard.replacedById) {
+        throw new ConflictException('Card was already replaced');
+      }
+
       const created = await tx.card.create({
         data: {
-          serialNumber: serialNumber || (await this.uniqueCardSerial(tx)),
+          serialNumber,
           nfcUid,
           walletId: oldCard.walletId,
           status: CardStatus.ACTIVE,
@@ -510,21 +685,33 @@ export class AdminService {
       await tx.card.update({
         where: { id: oldCard.id },
         data: {
-          status: CardStatus.REPLACED,
+          status: CardStatus.LOST,
           replacedById: created.id,
         },
       });
+      await this.sms.enqueue(
+        phone,
+        'CARD_RENEWED',
+        renewalSms(serialNumber, oldCard.wallet.balance, 0),
+        tx,
+      );
       return created;
     });
 
     await this.audit(actor.id, 'CARD_REPLACE', 'Card', oldCard.id, {
-      oldSerial: oldCard.serialNumber,
-      newSerial: replacement.serialNumber,
+      serialNumber,
+      oldNfcUid: oldCard.nfcUid,
+      newNfcUid: replacement.nfcUid,
     });
+    void this.smsDispatcher?.flush();
 
     return {
-      message: 'Card replaced. Wallet balance is unchanged.',
-      oldCard: oldCard.serialNumber,
+      message: 'Card replaced. The card number and wallet balance are unchanged.',
+      oldCard: serialNumber,
+      previousCard: {
+        nfcUid: oldCard.nfcUid,
+        status: CardStatus.LOST,
+      },
       card: {
         serialNumber: replacement.serialNumber,
         nfcUid: replacement.nfcUid,
@@ -579,7 +766,7 @@ export class AdminService {
       }),
     ]);
 
-    return { page, limit, total, wallets };
+    return presentNames({ page, limit, total, wallets });
   }
 
   async getWallet(id: string) {
@@ -601,7 +788,7 @@ export class AdminService {
     if (!wallet) {
       throw new NotFoundException('Wallet not found');
     }
-    return wallet;
+    return presentNames(wallet);
   }
 
   async freezeWallet(actor: User, id: string) {
@@ -710,8 +897,10 @@ export class AdminService {
         createdAt: t.createdAt,
         card: t.card.serialNumber,
         wallet: t.wallet.publicCode,
-        passenger:
-          `${t.wallet.customer.firstName} ${t.wallet.customer.lastName}`.trim(),
+        passenger: personName(
+          t.wallet.customer.firstName,
+          t.wallet.customer.lastName,
+        ),
         phone: t.wallet.customer.phone,
         merchant: t.merchant,
         terminal: t.terminal,
@@ -756,7 +945,7 @@ export class AdminService {
       }),
     ]);
 
-    return { page, limit, total, topUps };
+    return presentNames({ page, limit, total, topUps });
   }
 
   async listAuditLogs(query: ListAuditLogsQueryDto) {
@@ -793,7 +982,7 @@ export class AdminService {
       }),
     ]);
 
-    return {
+    return presentNames({
       page,
       limit,
       total,
@@ -809,7 +998,7 @@ export class AdminService {
           role: this.toApiRole(log.actor.role),
         },
       })),
-    };
+    });
   }
 
   async health() {
@@ -898,7 +1087,7 @@ export class AdminService {
       }),
     ]);
 
-    return { page, limit, total, customers };
+    return presentNames({ page, limit, total, customers });
   }
 
   async getCustomer(id: string) {
@@ -923,7 +1112,7 @@ export class AdminService {
     if (!customer) {
       throw new NotFoundException('Customer not found');
     }
-    return customer;
+    return presentNames(customer);
   }
 
   async updateCustomerStatus(
@@ -946,13 +1135,13 @@ export class AdminService {
       to: dto.status,
     });
 
-    return {
+    return presentNames({
       id: updated.id,
       firstName: updated.firstName,
       lastName: updated.lastName,
       phone: updated.phone,
       status: updated.status,
-    };
+    });
   }
 
   async listWithdrawals(query: ListWithdrawalsQueryDto) {
@@ -1075,31 +1264,87 @@ export class AdminService {
   }
 
   async markWithdrawalPaid(actor: User, id: string) {
-    const withdrawal = await this.prisma.withdrawal.findUnique({
-      where: { id },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const withdrawal = await tx.withdrawal.findUnique({
+        where: { id },
+      });
+      if (!withdrawal) {
+        throw new NotFoundException('Withdrawal not found');
+      }
+      if (withdrawal.status !== WithdrawalStatus.APPROVED) {
+        throw new BadRequestException(
+          'Only APPROVED withdrawals can be marked paid',
+        );
+      }
+
+      const next = await tx.withdrawal.update({
+        where: { id },
+        data: {
+          status: WithdrawalStatus.PAID,
+          processedById: actor.id,
+          processedAt: new Date(),
+        },
+      });
+
+      const posted = next.conductorUserId
+        ? await this.floats.record(tx, {
+            agentUserId: next.agentUserId,
+            type: WakalaFloatTransactionType.CONDUCTOR_WITHDRAWAL,
+            amount: next.amount,
+            reference: next.reference,
+            reason: 'Conductor withdrawal marked paid',
+            withdrawalId: next.id,
+          })
+        : null;
+
+      await tx.auditLog.create({
+        data: {
+          actorUserId: actor.id,
+          action: 'WITHDRAWAL_PAID',
+          entityType: 'Withdrawal',
+          entityId: id,
+          metadata: {
+            reference: next.reference,
+            amount: next.amount,
+            floatCredited: Boolean(next.conductorUserId),
+          },
+        },
+      });
+
+      return { next, posted };
     });
-    if (!withdrawal) {
-      throw new NotFoundException('Withdrawal not found');
+
+    if (
+      updated.posted &&
+      !updated.posted.alreadyPosted &&
+      updated.next.conductorUserId
+    ) {
+      const [conductor, wakala] = await Promise.all([
+        this.prisma.user.findUnique({
+          where: { id: updated.next.conductorUserId },
+        }),
+        this.prisma.user.findUnique({
+          where: { id: updated.next.agentUserId },
+        }),
+      ]);
+      if (conductor && wakala) {
+        try {
+          await queuePaidWithdrawalSms(this.sms, {
+            amount: updated.next.amount,
+            fee: updated.next.platformFee,
+            reference: updated.next.reference,
+            conductorPhone: conductor.phone,
+            wakalaPhone: wakala.phone,
+            floatBalance: updated.posted.balanceAfter,
+          });
+          void this.smsDispatcher?.flush();
+        } catch {
+          // The paid withdrawal is already committed.
+        }
+      }
     }
-    if (withdrawal.status !== WithdrawalStatus.APPROVED) {
-      throw new BadRequestException('Only APPROVED withdrawals can be marked paid');
-    }
 
-    const updated = await this.prisma.withdrawal.update({
-      where: { id },
-      data: {
-        status: WithdrawalStatus.PAID,
-        processedById: actor.id,
-        processedAt: new Date(),
-      },
-    });
-
-    await this.audit(actor.id, 'WITHDRAWAL_PAID', 'Withdrawal', id, {
-      reference: updated.reference,
-      amount: updated.amount,
-    });
-
-    return updated;
+    return updated.next;
   }
 
   async listRefunds(query: ListRefundsQueryDto) {
@@ -1231,7 +1476,7 @@ export class AdminService {
       await this.sms.enqueue(
         wallet.customer.phone,
         'WALLET_REFUND',
-        `Marejesho TZS ${tx.amount}. Salio TZS ${newBalance}. Kumb. ${tx.reference}.`,
+        refundSms(tx.amount, newBalance, tx.reference),
         db,
       );
 
@@ -1594,9 +1839,7 @@ export class AdminService {
         return {
           agentUserId: row.agentUserId,
           username: agent?.username ?? null,
-          name: agent
-            ? `${agent.firstName} ${agent.lastName}`.trim()
-            : null,
+          name: agent ? personName(agent.firstName, agent.lastName) : null,
           volume: row._sum.amount ?? 0,
           count: row._count,
         };
@@ -1824,23 +2067,42 @@ export class AdminService {
 
   private async findCardBySerial(serial: string) {
     const serialNumber = serial.trim().toUpperCase();
-    const card = await this.prisma.card.findUnique({
-      where: { serialNumber },
-      include: {
-        wallet: {
-          include: {
-            customer: {
-              select: {
-                firstName: true,
-                lastName: true,
-                phone: true,
-                status: true,
-              },
+    const include = {
+      replaces: {
+        select: {
+          nfcUid: true,
+          status: true,
+          serialNumber: true,
+        },
+      },
+      wallet: {
+        include: {
+          customer: {
+            select: {
+              firstName: true,
+              lastName: true,
+              phone: true,
+              status: true,
             },
           },
         },
       },
+    } as const;
+    const live = await this.prisma.card.findFirst({
+      where: {
+        serialNumber,
+        status: { in: [CardStatus.ACTIVE, CardStatus.FROZEN] },
+      },
+      include,
+      orderBy: { issuedAt: 'desc' },
     });
+    const card =
+      live ??
+      (await this.prisma.card.findFirst({
+        where: { serialNumber },
+        include,
+        orderBy: { issuedAt: 'desc' },
+      }));
     if (!card) {
       throw new NotFoundException('Card not found');
     }
@@ -1873,16 +2135,389 @@ export class AdminService {
     return range;
   }
 
-  private toApiRole(role: UserRole): 'admin' | 'agent' | 'conductor' {
-    if (role === UserRole.ADMIN) return 'admin';
-    if (role === UserRole.AGENT) return 'agent';
-    return 'conductor';
+  async listMasterWakala(actor: User) {
+    this.requireAdmin(actor);
+    const users = await this.prisma.user.findMany({
+      where: { role: UserRole.MASTER_AGENT },
+      orderBy: { createdAt: 'desc' },
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+    return {
+      users: users.map((user) => this.masterView(user)),
+    };
   }
 
-  private async uniqueConductorUsername(): Promise<string> {
+  async getMasterWakala(actor: User, id: string) {
+    this.requireAdmin(actor);
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+    if (!user || user.role !== UserRole.MASTER_AGENT) {
+      throw new NotFoundException('Master Wakala not found');
+    }
+    return this.masterView(user);
+  }
+
+  async createMasterWakala(actor: User, dto: CreateMasterWakalaDto) {
+    this.requireAdmin(actor);
+    this.authz.assertRoleChange(actor, 'new-master', UserRole.MASTER_AGENT);
+    const permissions = this.authz.assertAssignable(dto.permissions ?? []);
+    const firstName = normalizeName(dto.firstName);
+    const lastName = normalizeName(dto.lastName);
+    const phone = normalizePhone(dto.phone);
+    const nida = normalizeNida(dto.nida);
+    const email = normalizeEmail(dto.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('Use a valid email');
+    }
+
+    const existingPhone = await this.prisma.user.findFirst({
+      where: { phone: { in: phoneLookupValues(phone) } },
+    });
+    if (existingPhone) {
+      throw new ConflictException('Phone number is already registered');
+    }
+    await assertNidaAvailable(this.prisma, nida, UserRole.MASTER_AGENT);
+    const existingEmail = await this.prisma.user.findFirst({
+      where: {
+        role: { in: [UserRole.ADMIN, UserRole.MASTER_AGENT] },
+        email: { equals: email, mode: 'insensitive' },
+      },
+    });
+    if (existingEmail) {
+      throw new ConflictException('Email is already registered');
+    }
+
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+    const username = await this.uniqueStaffUsername(UserRole.MASTER_AGENT);
+    const user = await this.prisma.user.create({
+      data: {
+        username,
+        passwordHash,
+        firstName,
+        lastName,
+        phone,
+        nida,
+        email,
+        role: UserRole.MASTER_AGENT,
+        mustChangePassword: true,
+        permissions: {
+          create: permissions.map((permissionCode) => ({ permissionCode })),
+        },
+      },
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+
+    await this.audit(actor.id, 'MASTER_AGENT_CREATED', 'User', user.id, {
+      targetUserId: user.id,
+      username: user.username,
+      onboarding: 'PENDING_EMAIL',
+    });
+    for (const code of permissions) {
+      await this.audit(actor.id, 'MASTER_AGENT_PERMISSION_GRANTED', 'User', user.id, {
+        targetUserId: user.id,
+        permission: code,
+      });
+    }
+
+    const delivered = await this.deliverMasterCredentials(
+      actor.id,
+      user,
+      temporaryPassword,
+      'MASTER_AGENT_EMAIL_SENT',
+    );
+    return {
+      ...this.masterView({
+        ...user,
+        credentialEmailSentAt: delivered.sentAt,
+      }),
+      emailSent: delivered.emailSent,
+      message: delivered.emailSent
+        ? 'Master Wakala account created and onboarding email sent.'
+        : 'Master Wakala account could not be fully onboarded because the onboarding email could not be sent.',
+    };
+  }
+
+  async resendMasterCredentials(actor: User, id: string) {
+    this.requireAdmin(actor);
+    const current = await this.requireMasterRecord(id);
+    if (!current.email) {
+      throw new BadRequestException('Master Wakala has no email address');
+    }
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data: {
+        passwordHash,
+        mustChangePassword: true,
+        credentialEmailSentAt: null,
+        sessionVersion: { increment: 1 },
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+    const delivered = await this.deliverMasterCredentials(
+      actor.id,
+      updated,
+      temporaryPassword,
+      'MASTER_AGENT_CREDENTIALS_RESENT',
+    );
+    return {
+      ...this.masterView({
+        ...updated,
+        credentialEmailSentAt: delivered.sentAt,
+      }),
+      emailSent: delivered.emailSent,
+      message: delivered.emailSent
+        ? 'Onboarding email sent.'
+        : 'Master Wakala account could not be fully onboarded because the onboarding email could not be sent.',
+    };
+  }
+
+  async sendTestEmail(actor: User, to: string) {
+    this.requireAdmin(actor);
+    if (!this.email) {
+      throw new ServiceUnavailableException('Email is not configured');
+    }
+    const result = await this.email.sendTest(normalizeEmail(to));
+    return {
+      sent: true,
+      provider: result.provider,
+      providerMessageId: result.providerMessageId,
+    };
+  }
+
+  private async deliverMasterCredentials(
+    actorUserId: string,
+    user: {
+      id: string;
+      email: string | null;
+      firstName: string;
+      lastName: string;
+      sessionVersion: number;
+    },
+    temporaryPassword: string,
+    successAction: string,
+  ): Promise<{ emailSent: boolean; sentAt: Date | null }> {
+    if (!user.email || !this.email) {
+      await this.audit(actorUserId, 'MASTER_AGENT_EMAIL_FAILED', 'User', user.id, {
+        targetUserId: user.id,
+        provider: 'resend',
+      });
+      return { emailSent: false, sentAt: null };
+    }
+    try {
+      const result = await this.email.sendMasterWakalaCredentials({
+        to: user.email,
+        fullName: personName(user.firstName, user.lastName),
+        temporaryPassword,
+        idempotencyKey: `master-wakala-${user.id}-${user.sessionVersion}`,
+      });
+      const sentAt = new Date();
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { credentialEmailSentAt: sentAt },
+      });
+      await this.audit(actorUserId, successAction, 'User', user.id, {
+        targetUserId: user.id,
+        provider: result.provider,
+        providerMessageId: result.providerMessageId,
+      });
+      return { emailSent: true, sentAt };
+    } catch {
+      await this.audit(actorUserId, 'MASTER_AGENT_EMAIL_FAILED', 'User', user.id, {
+        targetUserId: user.id,
+        provider: 'resend',
+      });
+      return { emailSent: false, sentAt: null };
+    }
+  }
+
+  async updateMasterWakala(actor: User, id: string, dto: UpdateMasterWakalaDto) {
+    this.requireAdmin(actor);
+    if ('role' in dto) {
+      throw new ForbiddenException('Role cannot be changed here');
+    }
+    await this.requireMasterRecord(id);
+    const data: Prisma.UserUpdateInput = {};
+    if (dto.firstName) data.firstName = normalizeName(dto.firstName);
+    if (dto.lastName) data.lastName = normalizeName(dto.lastName);
+    if (dto.phone) {
+      const phone = normalizePhone(dto.phone);
+      const taken = await this.prisma.user.findFirst({
+        where: { phone: { in: phoneLookupValues(phone) }, NOT: { id } },
+      });
+      if (taken) throw new ConflictException('Phone number is already registered');
+      data.phone = phone;
+    }
+    if (dto.email) {
+      const email = normalizeEmail(dto.email);
+      const taken = await this.prisma.user.findFirst({
+        where: {
+          id: { not: id },
+          role: { in: [UserRole.ADMIN, UserRole.MASTER_AGENT] },
+          email: { equals: email, mode: 'insensitive' },
+        },
+      });
+      if (taken) throw new ConflictException('Email is already registered');
+      data.email = email;
+    }
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data,
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+    await this.audit(actor.id, 'MASTER_AGENT_UPDATED', 'User', id, {
+      targetUserId: id,
+      fields: Object.keys(data),
+    });
+    return this.masterView(updated);
+  }
+
+  async setMasterPermissions(actor: User, id: string, codes: string[]) {
+    this.authz.assertCanManageMasterPermissions(actor, id);
+    const next = this.authz.assertAssignable(codes);
+    await this.requireMasterRecord(id);
+    const current = await this.prisma.userPermission.findMany({
+      where: { userId: id },
+      select: { permissionCode: true },
+    });
+    const currentCodes = new Set(current.map((row) => row.permissionCode));
+    const nextCodes = new Set<string>(next);
+    const granted = next.filter((code) => !currentCodes.has(code));
+    const revoked = [...currentCodes].filter((code) => !nextCodes.has(code));
+
+    await this.prisma.$transaction(async (tx) => {
+      if (revoked.length) {
+        await tx.userPermission.deleteMany({
+          where: { userId: id, permissionCode: { in: revoked } },
+        });
+      }
+      if (granted.length) {
+        await tx.userPermission.createMany({
+          data: granted.map((permissionCode) => ({ userId: id, permissionCode })),
+        });
+      }
+      for (const code of granted) {
+        await tx.auditLog.create({
+          data: {
+            actorUserId: actor.id,
+            action: 'MASTER_AGENT_PERMISSION_GRANTED',
+            entityType: 'User',
+            entityId: id,
+            metadata: { targetUserId: id, permission: code },
+          },
+        });
+      }
+      for (const code of revoked) {
+        await tx.auditLog.create({
+          data: {
+            actorUserId: actor.id,
+            action: 'MASTER_AGENT_PERMISSION_REVOKED',
+            entityType: 'User',
+            entityId: id,
+            metadata: { targetUserId: id, permission: code },
+          },
+        });
+      }
+    });
+
+    return { id, permissions: next };
+  }
+
+  async blockMasterWakala(actor: User, id: string) {
+    return this.setMasterStatus(actor, id, UserStatus.SUSPENDED, 'MASTER_AGENT_BLOCKED');
+  }
+
+  async unblockMasterWakala(actor: User, id: string) {
+    return this.setMasterStatus(actor, id, UserStatus.ACTIVE, 'MASTER_AGENT_UNBLOCKED');
+  }
+
+  async deactivateMasterWakala(actor: User, id: string) {
+    return this.setMasterStatus(
+      actor,
+      id,
+      UserStatus.INACTIVE,
+      'MASTER_AGENT_DEACTIVATED',
+    );
+  }
+
+  private requireAdmin(actor: User) {
+    if (actor.role !== UserRole.ADMIN) {
+      throw new ForbiddenException();
+    }
+  }
+
+  private async requireMasterRecord(id: string) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user || user.role !== UserRole.MASTER_AGENT) {
+      throw new NotFoundException('Master Wakala not found');
+    }
+    return user;
+  }
+
+  private async setMasterStatus(
+    actor: User,
+    id: string,
+    status: UserStatus,
+    action: string,
+  ) {
+    this.requireAdmin(actor);
+    if (actor.id === id) {
+      throw new ForbiddenException('You cannot change your own account');
+    }
+    const user = await this.requireMasterRecord(id);
+    const updated = await this.prisma.user.update({
+      where: { id },
+      data: { status, sessionVersion: { increment: 1 } },
+      include: { permissions: { select: { permissionCode: true } } },
+    });
+    await this.audit(actor.id, action, 'User', id, {
+      targetUserId: id,
+      from: user.status,
+      to: status,
+    });
+    return this.masterView(updated);
+  }
+
+  private masterView(user: {
+    id: string;
+    username: string;
+    firstName: string;
+    lastName: string;
+    phone: string;
+    email: string | null;
+    status: UserStatus;
+    createdAt: Date;
+    credentialEmailSentAt?: Date | null;
+    permissions?: { permissionCode: string }[];
+  }) {
+    return presentNames({
+      id: user.id,
+      username: user.username,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      phone: user.phone,
+      email: user.email,
+      role: 'master_agent' as const,
+      status: user.status,
+      createdAt: user.createdAt,
+      permissions: (user.permissions ?? []).map((row) => row.permissionCode),
+      onboarding: user.credentialEmailSentAt ? ('EMAIL_SENT' as const) : ('PENDING_EMAIL' as const),
+    });
+  }
+
+  private async uniqueStaffUsername(role: UserRole): Promise<string> {
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const code = String(randomInt(100000, 1000000));
-      const username = `Bp-c${code}bus`;
+      const username =
+        role === UserRole.MASTER_AGENT
+          ? `Bp-m${code}lead`
+          : `Bp-a${code}agent`;
       const taken = await this.prisma.user.findFirst({
         where: { username: { equals: username, mode: 'insensitive' } },
       });
@@ -1891,12 +2526,49 @@ export class AdminService {
     throw new ConflictException('Could not generate a unique username');
   }
 
-  private async uniqueCardSerial(tx: Prisma.TransactionClient): Promise<string> {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const code = `BP-${String(randomInt(100000000, 1000000000))}`;
-      const taken = await tx.card.findUnique({ where: { serialNumber: code } });
-      if (!taken) return code;
+  private toApiRole(
+    role: UserRole,
+  ): 'admin' | 'agent' | 'conductor' | 'master_agent' {
+    if (role === UserRole.ADMIN) return 'admin';
+    if (role === UserRole.MASTER_AGENT) return 'master_agent';
+    if (role === UserRole.AGENT) return 'agent';
+    return 'conductor';
+  }
+
+  private async requireAgent(id: string) {
+    const agent = await this.prisma.user.findUnique({ where: { id } });
+    if (!agent || agent.role !== UserRole.AGENT) {
+      throw new NotFoundException('Wakala not found');
     }
-    throw new ConflictException('Could not generate a unique card serial');
+    return agent;
+  }
+
+  private agentSummary(agent: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    tillNumber: string | null;
+    phone: string;
+  }) {
+    return {
+      id: agent.id,
+      name: personName(agent.firstName, agent.lastName),
+      tillNumber: agent.tillNumber,
+      phone: agent.phone,
+    };
+  }
+
+  private async uniqueConductorUsername(
+    db: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<string> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const code = String(randomInt(100000, 1000000));
+      const username = `Bp-c${code}bus`;
+      const taken = await db.user.findFirst({
+        where: { username: { equals: username, mode: 'insensitive' } },
+      });
+      if (!taken) return username;
+    }
+    throw new ConflictException('Could not generate a unique username');
   }
 }

@@ -47,5 +47,37 @@ export function NidaField() {
   return Transform(({ value }: { value: unknown }) => normalizeNida(value));
 }
 
+/** Person names are stored and shown in capitals, with extra spaces removed. */
+export function normalizeName(value: string) {
+  return value.replace(/\s+/g, ' ').trim().toLocaleUpperCase('en-US');
+}
+
+export function personName(firstName: string, lastName: string) {
+  return normalizeName(`${firstName} ${lastName}`);
+}
+
+const PERSON_NAME_KEYS = new Set(['firstName', 'lastName', 'accountName']);
+
+/** Uppercase person-name fields in an API payload, including nested customers. */
+export function presentNames<T>(value: T): T {
+  return walkNames(value) as T;
+}
+
+function walkNames(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(walkNames);
+  if (!value || typeof value !== 'object' || value instanceof Date) return value;
+  const next: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (PERSON_NAME_KEYS.has(key) && typeof child === 'string') {
+      next[key] = normalizeName(child);
+    } else if (child && typeof child === 'object') {
+      next[key] = walkNames(child);
+    } else {
+      next[key] = child;
+    }
+  }
+  return next;
+}
+
 export const NIDA_PATTERN = /^\d{20}$/;
 export const NIDA_MESSAGE = 'NIDA must be 20 digits';

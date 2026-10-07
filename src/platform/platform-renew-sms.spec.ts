@@ -1,5 +1,6 @@
 import { CardStatus } from '../generated/prisma';
 import { SmsService } from '../sms/sms.service';
+import { idleBooks } from '../financial/idle-books';
 import { PlatformService } from './platform.service';
 
 function cardFixture() {
@@ -62,6 +63,8 @@ describe('card renewal SMS', () => {
       prisma as never,
       new SmsService(prisma as never),
       { flush: jest.fn() } as never,
+      { assertCanDebit: jest.fn(), record: jest.fn() } as never,
+      idleBooks(),
     );
 
     await service.renewCard('BP1', { amount: 0 });
@@ -113,6 +116,8 @@ describe('card renewal SMS', () => {
       prisma as never,
       new SmsService(prisma as never),
       { flush: jest.fn() } as never,
+      { assertCanDebit: jest.fn(), record: jest.fn() } as never,
+      idleBooks(),
     );
 
     await expect(service.renewCard('BP1', { amount: 0 })).rejects.toThrow(

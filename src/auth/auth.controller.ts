@@ -1,4 +1,4 @@
-import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 
 import { UserRole, type User } from '../generated/prisma';
 import { AuthRateLimitGuard } from './auth-rate-limit.guard';
@@ -15,6 +15,9 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResetPinDto } from './dto/reset-pin.dto';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import { PermissionGuard } from './permission.guard';
+import { Permissions } from './permissions.decorator';
+import { PermissionCode } from './permissions';
 import { Roles } from './roles.decorator';
 import { RolesGuard } from './roles.guard';
 
@@ -33,9 +36,27 @@ export class AuthController {
     return this.authService.loginAdmin(dto);
   }
 
-  @Post('admin/wakala')
+  @Get('admin/session')
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.ADMIN)
+  @Roles(UserRole.ADMIN, UserRole.MASTER_AGENT)
+  dashboardSession(@CurrentUser() user: User) {
+    return this.authService.dashboardSession(user);
+  }
+
+  @Post('admin/change-password')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.MASTER_AGENT)
+  changeDashboardPassword(
+    @CurrentUser() user: User,
+    @Body() dto: ChangePasswordDto,
+  ) {
+    return this.authService.changeDashboardPassword(user, dto);
+  }
+
+  @Post('admin/wakala')
+  @UseGuards(JwtAuthGuard, RolesGuard, PermissionGuard)
+  @Roles(UserRole.ADMIN, UserRole.MASTER_AGENT)
+  @Permissions(PermissionCode.WAKALA_CREATE)
   createWakala(
     @CurrentUser() user: User,
     @Body() dto: CreateWakalaDto,

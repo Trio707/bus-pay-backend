@@ -11,6 +11,7 @@ enum UserRole {
   ADMIN
   CONDUCTOR
   AGENT
+  MASTER_AGENT
 }
 
 enum UserStatus {
@@ -81,6 +82,29 @@ enum TopUpSource {
   AGENT_TOPUP
   INITIAL_LOAD
   ADMIN_ADJUST
+  MOBILE_MONEY
+}
+
+enum DepositChannel {
+  MOBILE_MONEY
+  BANK
+}
+
+enum MobileMoneyNetwork {
+  MPESA
+  AIRTEL_MONEY
+  MIXX_BY_YAS
+  HALOPESA
+  OTHER
+}
+
+enum WalletDepositStatus {
+  PENDING
+  PROCESSING
+  UNKNOWN
+  COMPLETED
+  FAILED
+  REVERSED
 }
 
 enum WithdrawalStatus {
@@ -88,6 +112,19 @@ enum WithdrawalStatus {
   APPROVED
   PAID
   REJECTED
+}
+
+enum ConductorPayoutMethod {
+  MOBILE_MONEY
+  BANK
+}
+
+enum ConductorPayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REVERSED
 }
 
 enum SettlementStatus {
@@ -117,6 +154,20 @@ enum RefundStatus {
   COMPLETED
 }
 
+enum WakalaFloatTransactionType {
+  FLOAT_FUNDING
+  PASSENGER_TOPUP
+  CONDUCTOR_WITHDRAWAL
+  ADJUSTMENT
+}
+
+/// How float was funded. ADMIN is the development path.
+/// PAYMENT_PROVIDER is reserved for a later verified Selcom/bank callback.
+enum WakalaFloatFundingChannel {
+  ADMIN
+  PAYMENT_PROVIDER
+}
+
 model User {
   id                  String     @id @default(uuid())
   username            String     @unique
@@ -124,8 +175,12 @@ model User {
   firstName           String
   lastName            String
   phone               String     @unique
-  nida                String     @unique
-  email               String?
+  nida                String
+  mustChangePassword    Boolean    @default(false)
+  credentialEmailSentAt DateTime?
+  profilePhotoKey       String?
+  profilePhotoUpdatedAt DateTime?
+  email                 String?
   tillNumber          String?
   role                UserRole
   status              UserStatus @default(ACTIVE)
@@ -141,8 +196,18 @@ model User {
   withdrawals         Withdrawal[]         @relation("WithdrawalAgent")
   withdrawalsProcessed Withdrawal[]        @relation("WithdrawalProcessor")
   conductorWithdrawals Withdrawal[]        @relation("WithdrawalConductor")
+  conductorPayouts    ConductorPayout[]
+  wakalaCommission    WakalaCommissionAccount?
   settlementsPaid     Settlement[]         @relation("SettlementPayer")
   refunds             Refund[]
+  wakalaFloat         WakalaFloat?
+  floatTransactions   WakalaFloatTransaction[]
+  companyFinanceRequested CompanyFinanceTransaction[] @relation("CompanyFinanceRequester")
+  companyFinanceApproved  CompanyFinanceTransaction[] @relation("CompanyFinanceApprover")
+  permissions         UserPermission[]
+
+  @@index([nida])
+  @@index([role, nida])
 }
 
 model Customer {
@@ -170,11 +235,14 @@ model Wallet {
   cards        Card[]
   transactions PaymentTransaction[]
   topUps       TopUp[]
+  deposits     WalletDeposit[]
 }
 
 model Card {
   id           String                @id @default(uuid())
-  serialNumber String                @unique
+  /// Permanent 12-digit BusPay account number. Historical physical cards share it.
+  /// One live card (ACTIVE or FROZEN) per number is enforced by Card_serialNumber_live_key.
+  serialNumber String
   nfcUid       String?               @unique
   status       CardStatus            @default(ACTIVE)
   issuedAt     DateTime              @default(now())
@@ -185,6 +253,8 @@ model Card {
   replaces     Card?                 @relation("CardReplacement")
   transactions PaymentTransaction[]
   topUps       TopUp[]
+
+  @@index([serialNumber])
 }
 
 model Merchant {
@@ -228,9 +298,13 @@ model PaymentTransaction {
   merchant    Merchant          @relation(fields: [merchantId], references: [id])
   terminalId  String?
   terminal    Terminal?         @relation(fields: [terminalId], references: [id])
-  amount      Int
-  currency    String            @default("TZS")
-  serviceType ServiceType
+  amount          Int
+  /// Conductor share of this fare. Historical rows keep the full amount.
+  conductorShare  Int
+  /// BusPay fare revenue for this tap. Historical rows are 0.
+  platformFee     Int           @default(0)
+  currency        String        @default("TZS")
+  serviceType     ServiceType
   status      TransactionStatus
   createdAt   DateTime          @default(now())
   refund      Refund?
@@ -304,6 +378,9 @@ model Withdrawal {
   conductorUserId String?
   conductor       User?            @relation("WithdrawalConductor", fields: [conductorUserId], references: [id])
   amount          Int
+  platformFee     Int              @default(0)
+  /// Cash handed over plus the platform fee reserved from conductor earnings.
+  totalDebit      Int
   status          WithdrawalStatus @default(PENDING)
   notes           String?
   requestedAt     DateTime         @default(now())
@@ -314,6 +391,68 @@ model Withdrawal {
   @@index([status, requestedAt])
   @@index([agentUserId])
   @@index([conductorUserId, requestedAt])
+}
+
+/// Electronic settlement of conductor earnings. Cash-out stays on Withdrawal.
+model ConductorPayout {
+  id                 String                 @id @default(uuid())
+  reference          String                 @unique
+  idempotencyKey     String
+  conductorUserId    String
+  conductor          User                   @relation(fields: [conductorUserId], references: [id])
+  amount             Int
+  platformFee        Int                    @default(0)
+  /// Disbursement plus platform fee. This is the amount reserved from earnings.
+  totalDebit         Int
+  method             ConductorPayoutMethod
+  provider           String
+  destination        String
+  accountName        String?
+  status             ConductorPayoutStatus  @default(PENDING)
+  providerReference  String?                @unique
+  failureReason      String?
+  requestedAt        DateTime               @default(now())
+  processingAt       DateTime?
+  completedAt        DateTime?
+  failedAt           DateTime?
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+
+  @@unique([conductorUserId, idempotencyKey])
+  @@index([conductorUserId, requestedAt])
+  @@index([status, requestedAt])
+}
+
+/// Direct mobile-money load into an existing BusPay wallet. Credited only from a verified callback.
+model WalletDeposit {
+  id                 String              @id @default(uuid())
+  reference          String              @unique
+  idempotencyKey     String
+  walletId           String
+  wallet             Wallet              @relation(fields: [walletId], references: [id])
+  walletPublicCode   String
+  customerId         String
+  amount             Int
+  channel            DepositChannel      @default(MOBILE_MONEY)
+  mobileMoneyNetwork MobileMoneyNetwork
+  provider           String
+  status             WalletDepositStatus @default(PENDING)
+  providerReference  String              @unique
+  customerPhone      String
+  failureReason      String?
+  topUpId            String?             @unique
+  requestedAt        DateTime            @default(now())
+  processingAt       DateTime?
+  completedAt        DateTime?
+  failedAt           DateTime?
+  reversedAt         DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  @@unique([walletId, idempotencyKey])
+  @@index([status, requestedAt])
+  @@index([walletPublicCode])
+  @@index([provider, requestedAt])
 }
 
 model Settlement {
@@ -392,9 +531,290 @@ model Alert {
   @@index([type])
 }
 
+model WakalaFloat {
+  id           String                   @id @default(uuid())
+  agentUserId  String                   @unique
+  agent        User                     @relation(fields: [agentUserId], references: [id])
+  balance      Int                      @default(0)
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
+  transactions WakalaFloatTransaction[]
+}
+
+model WakalaFloatTransaction {
+  id                String                      @id @default(uuid())
+  floatId           String
+  float             WakalaFloat                 @relation(fields: [floatId], references: [id])
+  agentUserId       String
+  agent             User                        @relation(fields: [agentUserId], references: [id])
+  type              WakalaFloatTransactionType
+  amount            Int
+  balanceBefore     Int
+  balanceAfter      Int
+  reference         String                      @unique
+  reason            String?
+  fundingChannel    WakalaFloatFundingChannel?
+  externalReference String?                     @unique
+  topUpId           String?                     @unique
+  withdrawalId      String?                     @unique
+  createdAt         DateTime                    @default(now())
+
+  @@index([agentUserId, createdAt])
+  @@index([floatId, createdAt])
+}
+
 model SystemSetting {
   id        String   @id @default(uuid())
   key       String   @unique
   value     String
   updatedAt DateTime @updatedAt
+}
+
+enum FinancialAccountType {
+  ASSET
+  LIABILITY
+  REVENUE
+  EXPENSE
+  EQUITY
+  CLEARING
+}
+
+enum FinancialAccountStatus {
+  ACTIVE
+  FROZEN
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerTransactionStatus {
+  POSTED
+  REVERSED
+}
+
+enum CommissionType {
+  REGISTRATION
+  TOP_UP
+  RENEWAL
+  ADJUSTMENT
+}
+
+enum CommissionEntryStatus {
+  PENDING
+  SETTLED
+  REVERSED
+}
+
+/// Control accounts for BusPay's internal books. Balances are whole TZS.
+model FinancialAccount {
+  id            String                 @id @default(uuid())
+  accountCode   String                 @unique
+  name          String
+  type          FinancialAccountType
+  currency      String                 @default("TZS")
+  status        FinancialAccountStatus @default(ACTIVE)
+  allowNegative Boolean                @default(false)
+  balance       Int                    @default(0)
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  entries       FinancialLedgerEntry[]
+}
+
+model FinancialLedgerTransaction {
+  id                   String                  @id @default(uuid())
+  transactionReference String                  @unique
+  transactionType      String
+  description          String
+  status               LedgerTransactionStatus @default(POSTED)
+  createdAt            DateTime                @default(now())
+  entries              FinancialLedgerEntry[]
+
+  @@index([transactionType, createdAt])
+}
+
+model FinancialLedgerEntry {
+  id                  String                     @id @default(uuid())
+  ledgerTransactionId String
+  ledgerTransaction   FinancialLedgerTransaction @relation(fields: [ledgerTransactionId], references: [id])
+  accountId           String
+  account             FinancialAccount           @relation(fields: [accountId], references: [id])
+  direction           LedgerDirection
+  amount              Int
+  currency            String                     @default("TZS")
+  referenceType       String?
+  referenceId         String?
+  description         String?
+  createdAt           DateTime                   @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([referenceType, referenceId])
+}
+
+/// Configurable fares, fees, and commissions. Missing rows fall back to documented defaults.
+model PricingPolicy {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  config    Json
+  updatedAt DateTime @updatedAt
+}
+
+/// Selcom and SMS costs stay unknown until a contract amount is stored.
+model ProviderCost {
+  id         String   @id @default(uuid())
+  provider   String
+  operation  String
+  amount     Int?
+  configured Boolean  @default(false)
+  currency   String   @default("TZS")
+  updatedAt  DateTime @updatedAt
+
+  @@unique([provider, operation])
+}
+
+model WakalaCommissionAccount {
+  id            String                   @id @default(uuid())
+  agentUserId   String                   @unique
+  agent         User                     @relation(fields: [agentUserId], references: [id])
+  balance       Int                      @default(0)
+  totalEarned   Int                      @default(0)
+  totalPaid     Int                      @default(0)
+  lastSettledAt DateTime?
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+  entries       WakalaCommissionEntry[]
+}
+
+model WakalaCommissionSettlement {
+  id         String                   @id @default(uuid())
+  reference  String                   @unique
+  agentUserId String
+  amount     Int
+  /// Internal batch only. No external payout is sent from this row.
+  status     String                   @default("READY")
+  createdAt  DateTime                 @default(now())
+  entries    WakalaCommissionEntry[]
+
+  @@index([agentUserId, createdAt])
+}
+
+model WakalaCommissionEntry {
+  id           String                      @id @default(uuid())
+  accountId    String
+  account      WakalaCommissionAccount     @relation(fields: [accountId], references: [id])
+  agentUserId  String
+  type         CommissionType
+  amount       Int
+  status       CommissionEntryStatus       @default(PENDING)
+  sourceType   String
+  sourceId     String
+  settlementId String?
+  settlement   WakalaCommissionSettlement? @relation(fields: [settlementId], references: [id])
+  createdAt    DateTime                    @default(now())
+
+  @@unique([sourceType, sourceId, type])
+  @@index([agentUserId, status])
+}
+
+enum CompanyBankAccountStatus {
+  ACTIVE
+  INACTIVE
+  CLOSED
+}
+
+enum CompanyFinanceType {
+  OWNER_DISTRIBUTION
+  COMPANY_EXPENSE
+  COMPANY_TRANSFER
+  COMPANY_DEPOSIT
+  COMPANY_ADJUSTMENT
+}
+
+enum CompanyFinanceStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  FAILED
+  REJECTED
+  REVERSED
+}
+
+/// A BusPay-owned cash book or bank account. The full account number is not stored.
+model CompanyBankAccount {
+  id                  String                   @id @default(uuid())
+  name                String
+  accountType         String
+  bankName            String?
+  accountNumberMasked String
+  ledgerAccountCode   String                   @unique
+  currency            String                   @default("TZS")
+  status              CompanyBankAccountStatus @default(ACTIVE)
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+  transactions        CompanyFinanceTransaction[] @relation("CompanyFinanceBank")
+  transferDestinations CompanyFinanceTransaction[] @relation("CompanyFinanceDestination")
+}
+
+/// Company-fund movement. Customer wallets, conductor earnings, and Wakala float are not this table.
+model CompanyFinanceTransaction {
+  id                       String               @id @default(uuid())
+  type                     CompanyFinanceType
+  amount                   Int
+  status                   CompanyFinanceStatus @default(PENDING)
+  description              String
+  reference                String               @unique
+  idempotencyKey           String               @unique
+  bankAccountId            String?
+  bankAccount              CompanyBankAccount?  @relation("CompanyFinanceBank", fields: [bankAccountId], references: [id])
+  destinationBankAccountId String?
+  destinationBankAccount   CompanyBankAccount?  @relation("CompanyFinanceDestination", fields: [destinationBankAccountId], references: [id])
+  destinationMasked        String?
+  expenseAccountCode       String?
+  requestedByUserId        String
+  requestedBy              User                 @relation("CompanyFinanceRequester", fields: [requestedByUserId], references: [id])
+  approvedByUserId         String?
+  approvedBy               User?                @relation("CompanyFinanceApprover", fields: [approvedByUserId], references: [id])
+  providerReference        String?              @unique
+  failureReason            String?
+  createdAt                DateTime             @default(now())
+  approvedAt               DateTime?
+  completedAt              DateTime?
+  updatedAt                DateTime             @updatedAt
+
+  @@index([type, createdAt])
+  @@index([status, createdAt])
+}
+
+model Permission {
+  code        String           @id
+  group       String
+  label       String
+  sensitive   Boolean          @default(false)
+  assignments UserPermission[]
+}
+
+model UserPermission {
+  userId         String
+  permissionCode String
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission     Permission @relation(fields: [permissionCode], references: [code], onDelete: Cascade)
+  createdAt      DateTime   @default(now())
+
+  @@id([userId, permissionCode])
+  @@index([permissionCode])
+}
+
+/// Remembers a completed financial request so a network retry returns the same result.
+model ApiIdempotency {
+  id         String   @id @default(uuid())
+  scope      String
+  key        String
+  entityType String
+  entityId   String
+  createdAt  DateTime @default(now())
+
+  @@unique([scope, key])
+  @@index([entityType, entityId])
 }

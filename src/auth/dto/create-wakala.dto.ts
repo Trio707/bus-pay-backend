@@ -1,4 +1,10 @@
-import { IsEmail, IsNotEmpty, IsString, Matches, MinLength } from 'class-validator';
+import {
+  IsEmail,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Matches,
+} from 'class-validator';
 
 import { EmailField } from '../email';
 import {
@@ -33,11 +39,8 @@ export class CreateWakalaDto {
   @Matches(NIDA_PATTERN, { message: NIDA_MESSAGE })
   nida: string;
 
+  /** Ignored when an admin creates the account. A temporary password is generated. */
+  @IsOptional()
   @IsString()
-  @MinLength(8)
-  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/, {
-    message:
-      'Password must be at least 8 characters with upper, lower, number and symbol',
-  })
-  password: string;
+  password?: string;
 }

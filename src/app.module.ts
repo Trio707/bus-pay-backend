@@ -7,6 +7,10 @@ import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { PlatformModule } from './platform/platform.module';
 import { AdminModule } from './admin/admin.module';
+import { DepositModule } from './deposit/deposit.module';
+import { PayoutModule } from './payout/payout.module';
+import { ProfilePhotoModule } from './profile-photo/profile-photo.module';
+import { EmailModule } from './email/email.module';
 import { SmsModule } from './sms/sms.module';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
@@ -31,7 +35,11 @@ const observeImports =
     AuthModule,
     PlatformModule,
     AdminModule,
+    PayoutModule,
+    DepositModule,
     SmsModule,
+    EmailModule,
+    ProfilePhotoModule,
   ],
   controllers: [AppController, HealthController],
   providers: [AppService],

@@ -15,7 +15,9 @@ import {
   TerminalStatus,
   TerminalType,
   TopUpSource,
+  ConductorPayoutStatus,
   TransactionStatus,
+  WakalaFloatTransactionType,
   type User,
   UserRole,
   UserStatus,
@@ -23,10 +25,21 @@ import {
   WithdrawalStatus,
 } from '../generated/prisma';
 
-import { normalizeNida, normalizePhone } from '../auth/identity';
+import {
+  normalizeName,
+  normalizeNida,
+  normalizePhone,
+  phoneLookupValues,
+} from '../auth/identity';
+import { BooksService } from '../financial/books.service';
+import { maskCardNumber, maskDestination } from '../payout/payout-mask';
 import { PrismaService } from '../prisma/prisma.service';
+import { lockConductorBalance } from './conductor-balance';
+import { mobileCursor, mobilePageSize } from './mobile-page';
 import { SmsDispatcherService } from '../sms/sms-dispatcher.service';
 import { SmsService } from '../sms/sms.service';
+import { fareSms, personName, registrationSms, renewalSms, topUpSms } from '../sms/sms-copy';
+import { queuePaidWithdrawalSms } from '../sms/withdrawal-sms';
 import {
   ActivateCardDto,
   ConductorWithdrawDto,
@@ -37,6 +50,8 @@ import {
   TapPaymentDto,
   TopUpDto,
 } from './dto/platform.dto';
+import { nfcUidMatchKeys, normalizeNfcUid, sameNfcUid } from './nfc-uid';
+import { WakalaFloatService } from './wakala-float.service';
 
 const SERVICE_TYPES = new Set<string>(Object.values(ServiceType));
 
@@ -46,6 +61,8 @@ export class PlatformService {
     private readonly prisma: PrismaService,
     private readonly sms: SmsService,
     private readonly smsDispatcher: SmsDispatcherService,
+    private readonly floats: WakalaFloatService,
+    private readonly books: BooksService,
   ) {}
 
   /**
@@ -58,8 +75,8 @@ export class PlatformService {
       throw new BadRequestException('nfcUid is required from the NFC scanner');
     }
 
-    const existing = await this.prisma.card.findUnique({
-      where: { nfcUid },
+    const existing = await this.prisma.card.findFirst({
+      where: { nfcUid: { in: nfcUidMatchKeys(nfcUid) } },
       include: {
         wallet: { include: { customer: true } },
       },
@@ -73,8 +90,8 @@ export class PlatformService {
         walletAccountNumber: existing.wallet.publicCode,
         status: existing.status,
         passenger: {
-          firstName: existing.wallet.customer.firstName,
-          lastName: existing.wallet.customer.lastName,
+          firstName: normalizeName(existing.wallet.customer.firstName),
+          lastName: normalizeName(existing.wallet.customer.lastName),
           phone: existing.wallet.customer.phone,
         },
         balance: existing.wallet.balance,
@@ -109,8 +126,8 @@ export class PlatformService {
       throw new BadRequestException('nfcUid is required from the NFC scanner');
     }
 
-    const card = await this.prisma.card.findUnique({
-      where: { nfcUid },
+    const card = await this.prisma.card.findFirst({
+      where: { nfcUid: { in: nfcUidMatchKeys(nfcUid) } },
       include: {
         wallet: { include: { customer: true } },
       },
@@ -136,8 +153,10 @@ export class PlatformService {
       throw new BadRequestException('Passenger account is not active');
     }
 
-    const passengerName =
-      `${card.wallet.customer.firstName} ${card.wallet.customer.lastName}`.trim();
+    const passengerName = personName(
+      card.wallet.customer.firstName,
+      card.wallet.customer.lastName,
+    );
 
     return {
       step: 'TOPUP_SCAN_OK',
@@ -146,12 +165,11 @@ export class PlatformService {
       /** Display fields for wakala UI */
       passenger: {
         name: passengerName,
-        firstName: card.wallet.customer.firstName,
-        lastName: card.wallet.customer.lastName,
+        firstName: normalizeName(card.wallet.customer.firstName),
+        lastName: normalizeName(card.wallet.customer.lastName),
         phone: card.wallet.customer.phone,
       },
       cardNumber: card.serialNumber,
-      balance: card.wallet.balance,
       walletAccountNumber: card.wallet.publicCode,
       /** Keep in app memory for confirm top-up — do not render in UI */
       nfcUid: card.nfcUid,
@@ -163,33 +181,39 @@ export class PlatformService {
    * Step: passenger names + card number + NFC UID → create/activate wallet (balance 0).
    * Next: POST /platform/wallets/topup for initial credit + SMS.
    */
-  async activateCard(dto: ActivateCardDto) {
-    return this.issueCard({
-      firstName: dto.firstName,
-      lastName: dto.lastName,
-      phone: dto.phone,
-      nida: dto.nida,
-      cardNumber: dto.cardNumber,
-      serialNumber: dto.cardNumber,
-      nfcUid: dto.nfcUid,
-      initialLoad: 0,
-    });
+  async activateCard(dto: ActivateCardDto, agent?: User) {
+    return this.issueCard(
+      {
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        phone: dto.phone,
+        nida: dto.nida,
+        cardNumber: dto.cardNumber,
+        serialNumber: dto.cardNumber,
+        nfcUid: dto.nfcUid,
+        initialLoad: 0,
+      },
+      agent,
+    );
   }
 
-  async issueCard(dto: IssueCardDto) {
+  async issueCard(dto: IssueCardDto, agent?: User) {
     const phone = normalizePhone(dto.phone);
     const nidaRaw = normalizeNida(dto.nida);
     const nida = nidaRaw.length === 20 ? nidaRaw : undefined;
     const nfcUid = this.normalizeUid(dto.nfcUid);
     const initialLoad = Math.max(0, dto.initialLoad ?? 0);
+    if (initialLoad > 0 && agent?.role !== UserRole.AGENT) {
+      throw new ForbiddenException(
+        'Only a wakala can load cash onto a passenger wallet',
+      );
+    }
 
     if (!nfcUid) {
       throw new BadRequestException('nfcUid is required from the NFC scanner');
     }
 
-    const takenUid = await this.prisma.card.findUnique({
-      where: { nfcUid },
-    });
+    const takenUid = await this.cardByUid(nfcUid);
     if (takenUid) {
       throw new ConflictException('NFC UID is already issued');
     }
@@ -200,7 +224,7 @@ export class PlatformService {
     if (!serialNumber) {
       serialNumber = await this.uniqueCardNumber();
     } else {
-      const taken = await this.prisma.card.findUnique({
+      const taken = await this.prisma.card.findFirst({
         where: { serialNumber },
       });
       if (taken) {
@@ -208,12 +232,19 @@ export class PlatformService {
       }
     }
 
+    const phoneKeys = phoneLookupValues(phone);
     const existingCustomer = await this.prisma.customer.findFirst({
-      where: nida ? { OR: [{ phone }, { nida }] } : { phone },
+      where: nida
+        ? { OR: [{ phone: { in: phoneKeys } }, { nida }] }
+        : { phone: { in: phoneKeys } },
       include: { wallet: true },
     });
 
-    if (existingCustomer && nida && existingCustomer.phone !== phone) {
+    if (
+      existingCustomer &&
+      nida &&
+      normalizePhone(existingCustomer.phone) !== phone
+    ) {
       throw new ConflictException('NIDA is already registered');
     }
     if (existingCustomer && nida && existingCustomer.nida !== nida) {
@@ -221,12 +252,16 @@ export class PlatformService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      if (initialLoad > 0 && agent) {
+        await this.floats.assertCanDebit(tx, agent.id, initialLoad);
+      }
+
       const customer =
         existingCustomer ??
         (await tx.customer.create({
           data: {
-            firstName: dto.firstName.trim(),
-            lastName: dto.lastName.trim(),
+            firstName: normalizeName(dto.firstName),
+            lastName: normalizeName(dto.lastName),
             phone,
             nida: nida ?? (await this.uniquePlaceholderNida()),
             status: UserStatus.ACTIVE,
@@ -237,8 +272,8 @@ export class PlatformService {
         await tx.customer.update({
           where: { id: customer.id },
           data: {
-            firstName: dto.firstName.trim(),
-            lastName: dto.lastName.trim(),
+            firstName: normalizeName(dto.firstName),
+            lastName: normalizeName(dto.lastName),
           },
         });
       }
@@ -270,35 +305,56 @@ export class PlatformService {
         },
       });
 
-      if (initialLoad > 0) {
-        await tx.topUp.create({
+      if (initialLoad > 0 && agent) {
+        const createdTopUp = await tx.topUp.create({
           data: {
             reference: await this.nextTopUpReference(tx),
             walletId: nextWallet.id,
             cardId: card.id,
+            agentUserId: agent.id,
             amount: initialLoad,
             previousBalance: nextWallet.balance - initialLoad,
             newBalance: nextWallet.balance,
             source: TopUpSource.INITIAL_LOAD,
           },
         });
+        await this.floats.record(tx, {
+          agentUserId: agent.id,
+          type: WakalaFloatTransactionType.PASSENGER_TOPUP,
+          amount: initialLoad,
+          reference: createdTopUp.reference,
+          reason: 'Card registration initial load',
+          topUpId: createdTopUp.id,
+        });
+        await this.books.postTopUp(tx, {
+          topUpId: createdTopUp.id,
+          agentUserId: agent.id,
+          amount: initialLoad,
+        });
       }
 
-      const passengerName = `${dto.firstName.trim()} ${dto.lastName.trim()}`;
-      const smsMessage =
-        initialLoad > 0
-          ? `Akaunti ${serialNumber} imeamilishwa kwa ${passengerName}. Salio TZS ${nextWallet.balance}. Tumia namba ya akaunti kwa top-up.`
-          : `Akaunti ${serialNumber} imeamilishwa kwa ${passengerName}. Salio TZS 0. Top-up kwa namba ${serialNumber} au akaunti ya pochi.`;
+      if (agent?.role === UserRole.AGENT) {
+        await this.books.postRegistration(tx, {
+          cardId: card.id,
+          agentUserId: agent.id,
+        });
+      }
 
-      await this.sms.enqueue(phone, 'CARD_REGISTERED', smsMessage, tx);
+      const passengerName = personName(dto.firstName, dto.lastName);
+      await this.sms.enqueue(
+        phone,
+        'CARD_REGISTERED',
+        registrationSms(passengerName, nextWallet.publicCode),
+        tx,
+      );
 
       return {
         card,
         wallet: nextWallet,
         customer: {
           ...customer,
-          firstName: dto.firstName.trim(),
-          lastName: dto.lastName.trim(),
+          firstName: normalizeName(dto.firstName),
+          lastName: normalizeName(dto.lastName),
           phone,
         },
       };
@@ -326,6 +382,11 @@ export class PlatformService {
     }
 
     const terminal = await this.requireConductorTerminal(user);
+    const idempotencyKey = this.cleanIdempotencyKey(dto.idempotencyKey);
+    if (idempotencyKey) {
+      const replay = await this.replayFare(terminal.id, idempotencyKey);
+      if (replay) return replay;
+    }
     const amount = dto.amount;
     const card = await this.findCard(dto.serialNumber, dto.nfcUid);
     if (card.status !== CardStatus.ACTIVE) {
@@ -346,9 +407,7 @@ export class PlatformService {
     if (dto.nfcUid && !card.nfcUid) {
       const uid = this.normalizeUid(dto.nfcUid);
       if (uid) {
-        const takenUid = await this.prisma.card.findUnique({
-          where: { nfcUid: uid },
-        });
+        const takenUid = await this.cardByUid(uid);
         if (takenUid) {
           throw new ConflictException('NFC UID is already issued');
         }
@@ -371,7 +430,10 @@ export class PlatformService {
       merchant.category,
     );
 
-    const updated = await this.prisma.$transaction(async (tx) => {
+    let updated: { payment: { reference: string; amount: number; status: TransactionStatus }; balance: number };
+    try {
+      updated = await this.prisma.$transaction(async (tx) => {
+      const split = await this.books.splitFare(tx, amount);
       const locked = await tx.wallet.update({
         where: { id: wallet.id },
         data: { balance: { decrement: amount } },
@@ -388,53 +450,66 @@ export class PlatformService {
           merchantId: merchant.id,
           terminalId: terminal.id,
           amount,
+          conductorShare: split.conductorShare,
+          platformFee: split.platformFee,
           serviceType,
           status: TransactionStatus.SUCCESS,
         },
+      });
+      await this.books.postFare(tx, {
+        paymentId: payment.id,
+        fare: amount,
+        conductorShare: split.conductorShare,
+        platformFee: split.platformFee,
       });
 
       await this.sms.enqueue(
         wallet.customer.phone,
         'PAYMENT_TAP',
-        `Umelipa TZS ${amount}. Salio TZS ${locked.balance}. Kumb. ${payment.reference}.`,
+        fareSms(amount, locked.balance, payment.reference),
         tx,
       );
 
+      if (idempotencyKey) {
+        await tx.apiIdempotency.create({
+          data: {
+            scope: this.fareScope(terminal.id),
+            key: idempotencyKey,
+            entityType: 'PaymentTransaction',
+            entityId: payment.id,
+          },
+        });
+      }
+
       return { payment, balance: locked.balance };
     });
+    } catch (error) {
+      if (idempotencyKey && this.isUniqueViolation(error)) {
+        const replay = await this.replayFare(terminal.id, idempotencyKey);
+        if (replay) return replay;
+      }
+      throw error;
+    }
 
     void this.smsDispatcher.flush();
 
-    return {
-      message: 'Payment successful',
-      reference: updated.payment.reference,
-      amount,
-      currency: 'TZS',
-      serviceType,
-      status: updated.payment.status,
-      smsQueued: true,
-      wallet: {
-        publicCode: wallet.publicCode,
-        balance: updated.balance,
-      },
-      card: {
-        serialNumber: card.serialNumber,
-      },
-      customer: {
-        firstName: wallet.customer.firstName,
-        lastName: wallet.customer.lastName,
-      },
-      merchant: {
-        merchantCode: merchant.merchantCode,
-        name: merchant.name,
-      },
-      terminal: terminal.terminalCode,
-    };
+    return this.fareReceipt(
+      updated.payment,
+      updated.balance,
+      card.serialNumber,
+      wallet.customer,
+    );
   }
 
   async topUp(user: User, dto: TopUpDto) {
     if (dto.amount < 1) {
       throw new BadRequestException('Amount must be greater than 0');
+    }
+
+    const idempotencyKey = this.cleanIdempotencyKey(dto.idempotencyKey);
+    if (idempotencyKey) {
+      const replay = await this.replayTopUp(user.id, idempotencyKey);
+      if (replay) return replay;
     }
 
     const account =
@@ -477,8 +552,18 @@ export class PlatformService {
     }
 
     const previousBalance = wallet.balance;
-    const { updated, activeCard } = await this.prisma.$transaction(
+    let updated: { publicCode: string; balance: number; status?: WalletStatus };
+    let activeCard: {
+      serialNumber: string;
+      nfcUid: string | null;
+      status: CardStatus;
+      issuedAt: Date;
+    } | null;
+    try {
+    const charged = await this.prisma.$transaction(
       async (tx) => {
+        await this.floats.assertCanDebit(tx, user.id, dto.amount);
+
         const nextWallet = await tx.wallet.update({
           where: { id: wallet.id },
           data: { balance: { increment: dto.amount } },
@@ -490,7 +575,7 @@ export class PlatformService {
             where: { walletId: wallet.id, status: CardStatus.ACTIVE },
           }));
 
-        await tx.topUp.create({
+        const createdTopUp = await tx.topUp.create({
           data: {
             reference: await this.nextTopUpReference(tx),
             walletId: wallet.id,
@@ -503,16 +588,50 @@ export class PlatformService {
           },
         });
 
+        await this.floats.record(tx, {
+          agentUserId: user.id,
+          type: WakalaFloatTransactionType.PASSENGER_TOPUP,
+          amount: dto.amount,
+          reference: createdTopUp.reference,
+          reason: 'Passenger top-up',
+          topUpId: createdTopUp.id,
+        });
+        await this.books.postTopUp(tx, {
+          topUpId: createdTopUp.id,
+          agentUserId: user.id,
+          amount: dto.amount,
+        });
+
         await this.sms.enqueue(
           wallet.customer.phone,
           'TOP_UP',
-          `Umepokea TZS ${dto.amount}. Salio jipya TZS ${nextWallet.balance}.`,
+          topUpSms(dto.amount, nextWallet.balance, createdTopUp.reference),
           tx,
         );
+
+        if (idempotencyKey) {
+          await tx.apiIdempotency.create({
+            data: {
+              scope: `topup:${user.id}`,
+              key: idempotencyKey,
+              entityType: 'TopUp',
+              entityId: createdTopUp.id,
+            },
+          });
+        }
 
         return { updated: nextWallet, activeCard: nextCard };
       },
     );
+    updated = charged.updated;
+    activeCard = charged.activeCard;
+    } catch (error) {
+      if (idempotencyKey && this.isUniqueViolation(error)) {
+        const replay = await this.replayTopUp(user.id, idempotencyKey);
+        if (replay) return replay;
+      }
+      throw error;
+    }
 
     const view = this.cardView(
       activeCard ?? {
@@ -527,8 +646,10 @@ export class PlatformService {
 
     void this.smsDispatcher.flush();
 
-    const passengerName =
-      `${wallet.customer.firstName} ${wallet.customer.lastName}`.trim();
+    const passengerName = personName(
+      wallet.customer.firstName,
+      wallet.customer.lastName,
+    );
 
     return {
       success: true,
@@ -537,43 +658,81 @@ export class PlatformService {
       message: 'Payment confirmed. Wallet credited.',
       paymentConfirmed: true,
       credited: dto.amount,
-      previousBalance,
       smsQueued: true,
       passenger: {
         name: passengerName,
-        firstName: wallet.customer.firstName,
-        lastName: wallet.customer.lastName,
+        firstName: normalizeName(wallet.customer.firstName),
+        lastName: normalizeName(wallet.customer.lastName),
       },
       cardNumber: view.card.cardNumber,
-      ...view,
+      card: {
+        cardNumber: view.card.cardNumber,
+        serialNumber: view.card.serialNumber,
+        nfcUid: view.card.nfcUid,
+        status: view.card.status,
+        frozen: view.card.frozen,
+        issuedAt: view.card.issuedAt,
+      },
+      wallet: {
+        walletAccountNumber: view.wallet.walletAccountNumber,
+        publicCode: view.wallet.publicCode,
+        status: view.wallet.status,
+      },
+      customer: view.customer,
     };
   }
 
-  async renewCard(serialNumber: string, dto: RenewCardDto) {
+  async renewCard(serialNumber: string, dto: RenewCardDto, agent?: User) {
+    const idempotencyKey = this.cleanIdempotencyKey(dto.idempotencyKey);
+    const renewScope = `renew:${agent?.id ?? serialNumber}`;
+    if (idempotencyKey) {
+      const replay = await this.replayRenew(renewScope, idempotencyKey, serialNumber);
+      if (replay) return replay;
+    }
     const card = await this.findCard(serialNumber, undefined);
     const nfcUid = this.normalizeUid(dto.nfcUid);
     const extra = Math.max(0, dto.amount ?? dto.initialLoad ?? 0);
+    if (extra > 0 && agent?.role !== UserRole.AGENT) {
+      throw new ForbiddenException(
+        'Only a wakala can load cash onto a passenger wallet',
+      );
+    }
+    if (!card.serialNumber) {
+      throw new BadRequestException(
+        'Existing card number could not be identified',
+      );
+    }
 
-    if (nfcUid) {
-      const takenUid = await this.prisma.card.findFirst({
-        where: { nfcUid, NOT: { id: card.id } },
+    const customerData = this.renewCustomerData(dto);
+
+    if (nfcUid && card.nfcUid && !sameNfcUid(card.nfcUid, nfcUid)) {
+      return this.replacePhysicalCard(card, nfcUid, {
+        extra,
+        agent,
+        customerData,
+        idempotencyKey,
+        idempotencyScope: renewScope,
       });
-      if (takenUid) {
+    }
+
+    if (nfcUid && sameNfcUid(card.nfcUid, nfcUid)) {
+      const already = await this.replayedReplacement(card);
+      if (already) return already;
+    }
+
+    if (nfcUid && !sameNfcUid(card.nfcUid, nfcUid)) {
+      const takenUid = await this.cardByUid(nfcUid);
+      if (takenUid && takenUid.id !== card.id) {
         throw new ConflictException('NFC UID is already issued');
       }
     }
 
-    const customerData: {
-      firstName?: string;
-      lastName?: string;
-      phone?: string;
-    } = {};
-    if (dto.firstName?.trim()) customerData.firstName = dto.firstName.trim();
-    if (dto.lastName?.trim()) customerData.lastName = dto.lastName.trim();
-    if (dto.phone) customerData.phone = normalizePhone(dto.phone);
-
     const [updatedCard, customer, wallet] = await this.prisma.$transaction(
       async (tx) => {
+        if (extra > 0 && agent) {
+          await this.floats.assertCanDebit(tx, agent.id, extra);
+        }
+
         const nextCard = await tx.card.update({
           where: { id: card.id },
           data: {
@@ -597,33 +756,55 @@ export class PlatformService {
               })
             : card.wallet;
 
-        if (extra > 0) {
-          await tx.topUp.create({
+        if (extra > 0 && agent) {
+          const createdTopUp = await tx.topUp.create({
             data: {
               reference: await this.nextTopUpReference(tx),
               walletId: nextWallet.id,
               cardId: nextCard.id,
+              agentUserId: agent.id,
               amount: extra,
               previousBalance,
               newBalance: nextWallet.balance,
               source: TopUpSource.AGENT_TOPUP,
             },
           });
+          await this.floats.record(tx, {
+            agentUserId: agent.id,
+            type: WakalaFloatTransactionType.PASSENGER_TOPUP,
+            amount: extra,
+            reference: createdTopUp.reference,
+            reason: 'Card renewal load',
+            topUpId: createdTopUp.id,
+          });
         }
-        const renewalMessage =
-          extra > 0
-            ? `Kadi ${serialNumber} imesasishwa. Umepokea TZS ${extra}. Salio TZS ${nextWallet.balance}.`
-            : `Kadi ${serialNumber} imesasishwa. Salio TZS ${nextWallet.balance}.`;
+        await this.books.postRenewal(tx, {
+          cardId: nextCard.id,
+          agentUserId: agent?.id,
+        });
         await this.sms.enqueue(
           nextCustomer.phone,
           'CARD_RENEWED',
-          renewalMessage,
+          this.renewalMessage(card.serialNumber, nextWallet.balance, extra),
           tx,
         );
+
+        if (idempotencyKey) {
+          await tx.apiIdempotency.create({
+            data: {
+              scope: renewScope,
+              key: idempotencyKey,
+              entityType: 'Card',
+              entityId: nextCard.id,
+            },
+          });
+        }
 
         return [nextCard, nextCustomer, nextWallet] as const;
       },
     );
+
+    void this.smsDispatcher.flush();
 
     return {
       success: true,
@@ -645,52 +826,437 @@ export class PlatformService {
     };
   }
 
-  async replaceCard(oldSerial: string, dto: ReplaceCardDto) {
-    const oldCard = await this.findCard(oldSerial, undefined);
-    const serialNumber = this.normalizeSerial(dto.serialNumber);
+  async replaceCard(oldSerial: string, dto: ReplaceCardDto, agent?: User) {
     const nfcUid = this.normalizeUid(dto.nfcUid);
-
-    if (serialNumber) {
-      const taken = await this.prisma.card.findUnique({
-        where: { serialNumber },
-      });
-      if (taken) {
-        throw new ConflictException('Card serial is already issued');
-      }
+    if (!nfcUid) {
+      throw new BadRequestException('nfcUid is required from the NFC scanner');
     }
 
-    const replacement = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.card.create({
-        data: {
-          serialNumber: serialNumber || (await this.uniqueCode('BP')),
-          nfcUid,
-          walletId: oldCard.walletId,
-          status: CardStatus.ACTIVE,
-        },
-      });
-      await tx.card.update({
-        where: { id: oldCard.id },
-        data: {
-          status: CardStatus.REPLACED,
-          replacedById: created.id,
-        },
-      });
-      return created;
+    const oldCard = await this.findCard(oldSerial, undefined);
+    if (!oldCard.serialNumber) {
+      throw new BadRequestException(
+        'Existing card number could not be identified',
+      );
+    }
+    const requested = this.normalizeSerial(dto.serialNumber);
+    if (requested && requested !== oldCard.serialNumber) {
+      throw new BadRequestException(
+        'Replacement keeps the existing card number',
+      );
+    }
+
+    if (sameNfcUid(oldCard.nfcUid, nfcUid)) {
+      const already = await this.replayedReplacement(oldCard);
+      if (already) return already;
+      throw new BadRequestException('Scan the new physical card');
+    }
+
+    return this.replacePhysicalCard(oldCard, nfcUid, {
+      extra: 0,
+      agent,
+      customerData: {},
     });
+  }
+
+  private renewCustomerData(dto: RenewCardDto) {
+    const customerData: {
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+    } = {};
+    if (dto.firstName?.trim()) customerData.firstName = normalizeName(dto.firstName);
+    if (dto.lastName?.trim()) customerData.lastName = normalizeName(dto.lastName);
+    if (dto.phone) customerData.phone = normalizePhone(dto.phone);
+    return customerData;
+  }
+
+  private renewalMessage(serialNumber: string, balance: number, extra: number) {
+    return renewalSms(serialNumber, balance, extra);
+  }
+
+  private async replayedReplacement(card: {
+    id: string;
+    serialNumber: string;
+    nfcUid?: string | null;
+    status: CardStatus;
+    issuedAt?: Date;
+    wallet: {
+      publicCode?: string;
+      balance: number;
+      status?: WalletStatus;
+      customer: { firstName: string; lastName: string; phone: string };
+    };
+  }) {
+    const predecessor = await this.prisma.card.findFirst({
+      where: { replacedById: card.id, serialNumber: card.serialNumber },
+    });
+    if (!predecessor || card.status !== CardStatus.ACTIVE) return null;
+    return {
+      success: true,
+      message: 'Card renewed',
+      alreadyReplaced: true,
+      ...this.cardView(card, card.wallet, card.wallet.customer),
+    };
+  }
+
+  /**
+   * Swap the physical NFC card. The permanent serialNumber, customer, and wallet stay.
+   */
+  private async replacePhysicalCard(
+    card: {
+      id: string;
+      serialNumber: string;
+      nfcUid?: string | null;
+      status: CardStatus;
+      walletId: string;
+      replacedById?: string | null;
+      wallet: {
+        id: string;
+        balance: number;
+        publicCode?: string;
+        status?: WalletStatus;
+        customer: {
+          id: string;
+          firstName: string;
+          lastName: string;
+          phone: string;
+        };
+      };
+    },
+    nfcUid: string,
+    options: {
+      extra: number;
+      agent?: User;
+      customerData: { firstName?: string; lastName?: string; phone?: string };
+      idempotencyKey?: string;
+      idempotencyScope?: string;
+    },
+  ) {
+    const taken = await this.cardByUid(nfcUid);
+    if (taken && taken.id !== card.id) {
+      if (
+        taken.status === CardStatus.ACTIVE &&
+        taken.walletId === card.walletId &&
+        taken.serialNumber === card.serialNumber &&
+        sameNfcUid(taken.nfcUid, nfcUid)
+      ) {
+        const live = await this.findCard(card.serialNumber, undefined);
+        const replay = await this.replayedReplacement(live);
+        if (replay) return replay;
+      }
+      throw new ConflictException('NFC UID is already issued');
+    }
+
+    if (
+      card.status !== CardStatus.ACTIVE &&
+      card.status !== CardStatus.FROZEN &&
+      card.replacedById
+    ) {
+      throw new ConflictException('Card was already replaced');
+    }
+
+    const { extra, agent, customerData, idempotencyKey, idempotencyScope } =
+      options;
+    const serialNumber = card.serialNumber;
+
+    const [updatedCard, customer, wallet, previousUid] =
+      await this.prisma.$transaction(async (tx) => {
+        if (extra > 0 && agent) {
+          await this.floats.assertCanDebit(tx, agent.id, extra);
+        }
+
+        const claimable =
+          card.status === CardStatus.ACTIVE || card.status === CardStatus.FROZEN;
+        if (claimable) {
+          const claimed = await tx.card.updateMany({
+            where: {
+              id: card.id,
+              status: { in: [CardStatus.ACTIVE, CardStatus.FROZEN] },
+            },
+            data: { status: CardStatus.LOST },
+          });
+          if (claimed.count !== 1) {
+            throw new ConflictException('Card was already replaced');
+          }
+        }
+
+        let created: {
+          id: string;
+          serialNumber: string;
+          nfcUid: string | null;
+          status: CardStatus;
+          issuedAt: Date;
+        };
+        try {
+          created = await tx.card.create({
+            data: {
+              serialNumber,
+              nfcUid,
+              walletId: card.walletId,
+              status: CardStatus.ACTIVE,
+            },
+          });
+        } catch (error) {
+          if (this.isUniqueViolation(error)) {
+            throw new ConflictException('Card was already replaced');
+          }
+          throw error;
+        }
+
+        if (created.serialNumber !== serialNumber) {
+          throw new ConflictException(
+            'Replacement must keep the existing card number',
+          );
+        }
+
+        await tx.card.update({
+          where: { id: card.id },
+          data: {
+            status: CardStatus.LOST,
+            replacedById: created.id,
+          },
+        });
+
+        const nextCustomer =
+          Object.keys(customerData).length > 0
+            ? await tx.customer.update({
+                where: { id: card.wallet.customer.id },
+                data: customerData,
+              })
+            : card.wallet.customer;
+
+        const previousBalance = card.wallet.balance;
+        const nextWallet =
+          extra > 0
+            ? await tx.wallet.update({
+                where: { id: card.wallet.id },
+                data: { balance: { increment: extra } },
+              })
+            : card.wallet;
+
+        if (extra > 0 && agent) {
+          const createdTopUp = await tx.topUp.create({
+            data: {
+              reference: await this.nextTopUpReference(tx),
+              walletId: nextWallet.id,
+              cardId: created.id,
+              agentUserId: agent.id,
+              amount: extra,
+              previousBalance,
+              newBalance: nextWallet.balance,
+              source: TopUpSource.AGENT_TOPUP,
+            },
+          });
+          await this.floats.record(tx, {
+            agentUserId: agent.id,
+            type: WakalaFloatTransactionType.PASSENGER_TOPUP,
+            amount: extra,
+            reference: createdTopUp.reference,
+            reason: 'Card renewal load',
+            topUpId: createdTopUp.id,
+          });
+        }
+        await this.books.postRenewal(tx, {
+          cardId: created.id,
+          agentUserId: agent?.id,
+        });
+
+        await this.sms.enqueue(
+          nextCustomer.phone,
+          'CARD_RENEWED',
+          this.renewalMessage(serialNumber, nextWallet.balance, extra),
+          tx,
+        );
+
+        if (idempotencyKey && idempotencyScope) {
+          await tx.apiIdempotency.create({
+            data: {
+              scope: idempotencyScope,
+              key: idempotencyKey,
+              entityType: 'Card',
+              entityId: created.id,
+            },
+          });
+        }
+
+        return [created, nextCustomer, nextWallet, card.nfcUid] as const;
+      });
+
+    void this.smsDispatcher.flush();
 
     return {
-      message: 'Card replaced. Wallet balance is unchanged.',
-      oldCard: oldCard.serialNumber,
-      card: {
-        serialNumber: replacement.serialNumber,
-        nfcUid: replacement.nfcUid,
-        status: replacement.status,
+      success: true,
+      message:
+        extra > 0
+          ? 'Card renewed'
+          : 'Card replaced. Wallet balance is unchanged.',
+      oldCard: serialNumber,
+      previousCard: {
+        nfcUid: previousUid,
+        status: CardStatus.LOST,
       },
-      wallet: {
-        publicCode: oldCard.wallet.publicCode,
-        balance: oldCard.wallet.balance,
+      ...this.cardView(updatedCard, wallet, customer),
+    };
+  }
+
+  private cleanIdempotencyKey(value?: string) {
+    const key = value?.trim();
+    return key ? key : undefined;
+  }
+
+  private fareScope(terminalId: string) {
+    return `fare:${terminalId}`;
+  }
+
+  private fareReceipt(
+    payment: { reference: string; amount: number; status: string },
+    balance: number,
+    serialNumber: string,
+    customer: { firstName: string; lastName: string },
+  ) {
+    return {
+      message: 'Payment successful',
+      reference: payment.reference,
+      amount: payment.amount,
+      status: payment.status,
+      wallet: { balance },
+      card: { serialNumber },
+      customer: {
+        firstName: normalizeName(customer.firstName),
+        lastName: normalizeName(customer.lastName),
       },
     };
+  }
+
+  private async replayFare(terminalId: string, key: string) {
+    const hit = await this.prisma.apiIdempotency.findUnique({
+      where: { scope_key: { scope: this.fareScope(terminalId), key } },
+    });
+    if (!hit || hit.entityType !== 'PaymentTransaction') return null;
+    const payment = await this.prisma.paymentTransaction.findUnique({
+      where: { id: hit.entityId },
+      include: {
+        card: { select: { serialNumber: true } },
+        wallet: { include: { customer: true } },
+      },
+    });
+    if (!payment) return null;
+    return this.fareReceipt(
+      payment,
+      payment.wallet.balance,
+      payment.card.serialNumber,
+      payment.wallet.customer,
+    );
+  }
+
+  private async replayTopUp(agentId: string, key: string) {
+    const hit = await this.prisma.apiIdempotency.findUnique({
+      where: { scope_key: { scope: `topup:${agentId}`, key } },
+    });
+    if (!hit || hit.entityType !== 'TopUp') return null;
+    const topUp = await this.prisma.topUp.findUnique({
+      where: { id: hit.entityId },
+      include: {
+        card: true,
+        wallet: { include: { customer: true } },
+      },
+    });
+    if (!topUp?.wallet.customer) return null;
+    const view = topUp.card
+      ? this.cardView(topUp.card, topUp.wallet, topUp.wallet.customer)
+      : null;
+    const passengerName = personName(
+      topUp.wallet.customer.firstName,
+      topUp.wallet.customer.lastName,
+    );
+    return {
+      success: true,
+      step: 'WALLET_CREDITED',
+      nextStep: 'DONE',
+      message: 'Payment confirmed. Wallet credited.',
+      paymentConfirmed: true,
+      credited: topUp.amount,
+      smsQueued: true,
+      passenger: {
+        name: passengerName,
+        firstName: normalizeName(topUp.wallet.customer.firstName),
+        lastName: normalizeName(topUp.wallet.customer.lastName),
+      },
+      cardNumber: view?.card.cardNumber ?? topUp.wallet.publicCode,
+      card: {
+        cardNumber: view?.card.cardNumber ?? topUp.wallet.publicCode,
+        serialNumber: view?.card.serialNumber ?? topUp.wallet.publicCode,
+        nfcUid: view?.card.nfcUid ?? null,
+        status: view?.card.status ?? CardStatus.ACTIVE,
+        frozen: view?.card.frozen ?? false,
+        issuedAt: view?.card.issuedAt ?? topUp.createdAt,
+      },
+      wallet: {
+        walletAccountNumber:
+          view?.wallet.walletAccountNumber ?? topUp.wallet.publicCode,
+        publicCode: topUp.wallet.publicCode,
+        status: topUp.wallet.status,
+      },
+      customer: view?.customer,
+    };
+  }
+
+  private async replayWithdrawal(user: User, key: string) {
+    const hit = await this.prisma.apiIdempotency.findUnique({
+      where: { scope_key: { scope: `cashout:${user.id}`, key } },
+    });
+    if (!hit || hit.entityType !== 'Withdrawal') return null;
+    const row = await this.prisma.withdrawal.findUnique({
+      where: { id: hit.entityId },
+      include: {
+        agent: {
+          select: { firstName: true, lastName: true, tillNumber: true },
+        },
+      },
+    });
+    if (!row) return null;
+    const terminal = await this.requireConductorTerminal(user);
+    const available = await this.conductorAvailableBalance(user.id, terminal.id);
+    return {
+      success: true,
+      message: 'Withdrawal successful',
+      reference: row.reference,
+      amount: row.amount,
+      fee: row.platformFee,
+      platformFee: row.platformFee,
+      netAmount: row.amount,
+      totalDebit: row.totalDebit,
+      available,
+      smsQueued: true,
+      agent: {
+        tillNumber: row.agent.tillNumber,
+        firstName: normalizeName(row.agent.firstName),
+        lastName: normalizeName(row.agent.lastName),
+        name: personName(row.agent.firstName, row.agent.lastName),
+      },
+    };
+  }
+
+  private async replayRenew(scope: string, key: string, serialNumber: string) {
+    const hit = await this.prisma.apiIdempotency.findUnique({
+      where: { scope_key: { scope, key } },
+    });
+    if (!hit) return null;
+    const card = await this.findCard(serialNumber, undefined);
+    return {
+      success: true,
+      message: 'Card renewed',
+      ...this.cardView(card, card.wallet, card.wallet.customer),
+    };
+  }
+
+  private isUniqueViolation(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: string }).code === 'P2002'
+    );
   }
 
   async lookupCard(serialNumber?: string, nfcUid?: string) {
@@ -698,95 +1264,144 @@ export class PlatformService {
     return this.cardView(card, card.wallet, card.wallet.customer);
   }
 
-  async getTransactions(user: User) {
+  async getFloat(user: User) {
+    if (user.role !== UserRole.AGENT) {
+      throw new ForbiddenException('Only a wakala can view float');
+    }
+    return this.floats.getBalance(user.id);
+  }
+
+  async listFloatTransactions(user: User, page?: string, limit?: string) {
+    if (user.role !== UserRole.AGENT) {
+      throw new ForbiddenException('Only a wakala can view float history');
+    }
+    const parsedPage = Number(page ?? 1);
+    const take = mobilePageSize(limit, 20);
+    return this.floats.listTransactions(
+      user.id,
+      Number.isFinite(parsedPage) ? parsedPage : 1,
+      take,
+    );
+  }
+
+  async getTransactions(
+    user: User,
+    query: { limit?: string; cursor?: string; since?: string; summary?: string } = {},
+  ) {
     const terminal = await this.requireConductorTerminal(user);
+    const take = mobilePageSize(query.limit, 20);
+    const cursor = mobileCursor(query.cursor);
+    const since = mobileCursor(query.since);
+    const summary = query.summary === '1' || query.summary === 'true';
+    const createdAt =
+      cursor || since
+        ? {
+            ...(since ? { gt: since } : {}),
+            ...(cursor ? { lt: cursor } : {}),
+          }
+        : undefined;
 
-    const transactions = await this.prisma.paymentTransaction.findMany({
-      where: {
-        terminalId: terminal.id,
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
-      include: {
-        card: {
-          select: {
-            serialNumber: true,
-          },
+    const [gross, available, withdrawn] = await Promise.all([
+      this.prisma.paymentTransaction.aggregate({
+        where: {
+          terminalId: terminal.id,
+          status: TransactionStatus.SUCCESS,
         },
-        wallet: {
-          select: {
-            customer: {
-              select: {
-                firstName: true,
-                lastName: true,
-              },
-            },
-          },
-        },
-        merchant: {
-          select: {
-            merchantCode: true,
-            name: true,
-          },
-        },
-        terminal: {
-          select: {
-            terminalCode: true,
-          },
-        },
-      },
-    });
+        _sum: { amount: true },
+      }),
+      this.conductorAvailableBalance(user.id, terminal.id),
+      this.conductorWithdrawnTotal(user.id),
+    ]);
 
-    const grossCollected = transactions
-      .filter((transaction) => transaction.status === TransactionStatus.SUCCESS)
-      .reduce((sum, transaction) => sum + transaction.amount, 0);
-
-    const withdrawn = await this.conductorWithdrawnTotal(user.id);
-    const available = Math.max(0, grossCollected - withdrawn);
-
-    const withdrawnRows = await this.prisma.withdrawal.findMany({
-      where: { conductorUserId: user.id },
-      orderBy: { requestedAt: 'desc' },
-      include: {
-        agent: {
-          select: {
-            firstName: true,
-            lastName: true,
-            tillNumber: true,
-          },
-        },
-      },
-    });
-
-    return {
+    const balances = {
       terminal: terminal.terminalCode,
       collected: available,
-      grossCollected,
+      grossCollected: gross._sum.amount ?? 0,
       withdrawn,
       available,
-      transactions: transactions.map((transaction) => ({
+      syncedAt: new Date().toISOString(),
+    };
+
+    if (summary) {
+      return {
+        ...balances,
+        limit: take,
+        hasMore: false,
+        nextCursor: null,
+        transactions: [],
+        withdrawals: [],
+        payouts: [],
+      };
+    }
+
+    const [transactions, withdrawnRows, payouts] = await Promise.all([
+      this.prisma.paymentTransaction.findMany({
+        where: { terminalId: terminal.id, ...(createdAt ? { createdAt } : {}) },
+        orderBy: { createdAt: 'desc' },
+        take: take + 1,
+        select: {
+          reference: true,
+          amount: true,
+          status: true,
+          createdAt: true,
+          card: { select: { serialNumber: true } },
+        },
+      }),
+      this.prisma.withdrawal.findMany({
+        where: {
+          conductorUserId: user.id,
+          ...(createdAt ? { requestedAt: createdAt } : {}),
+        },
+        orderBy: { requestedAt: 'desc' },
+        take: take + 1,
+        select: {
+          reference: true,
+          amount: true,
+          status: true,
+          requestedAt: true,
+          agent: {
+            select: { firstName: true, lastName: true, tillNumber: true },
+          },
+        },
+      }),
+      this.conductorPayoutRows(user.id, take + 1, cursor, since),
+    ]);
+
+    const farePage = transactions.slice(0, take);
+    const withdrawalPage = withdrawnRows.slice(0, take);
+    const payoutPage = payouts.slice(0, take);
+    const stamps = [
+      farePage[farePage.length - 1]?.createdAt,
+      withdrawalPage[withdrawalPage.length - 1]?.requestedAt,
+      payoutPage[payoutPage.length - 1]?.createdAt,
+    ].filter((value): value is Date => value instanceof Date);
+    stamps.sort((left, right) => left.getTime() - right.getTime());
+    const oldest = stamps[0];
+
+    return {
+      ...balances,
+      limit: take,
+      hasMore:
+        transactions.length > take ||
+        withdrawnRows.length > take ||
+        payouts.length > take,
+      nextCursor: oldest ? oldest.toISOString() : null,
+      transactions: farePage.map((transaction) => ({
         reference: transaction.reference,
         amount: transaction.amount,
-        currency: transaction.currency,
-        serviceType: transaction.serviceType,
         status: transaction.status,
-        card: transaction.card.serialNumber,
-        passenger:
-          `${transaction.wallet.customer.firstName} ${transaction.wallet.customer.lastName}`.trim(),
-        merchant: transaction.merchant.name,
-        terminal: transaction.terminal?.terminalCode ?? null,
+        card: maskCardNumber(transaction.card.serialNumber),
         createdAt: transaction.createdAt,
       })),
-      withdrawals: withdrawnRows.map((row) => ({
+      withdrawals: withdrawalPage.map((row) => ({
         reference: row.reference,
         amount: row.amount,
         status: row.status,
         tillNumber: row.agent.tillNumber,
-        agent:
-          `${row.agent.firstName} ${row.agent.lastName}`.trim(),
+        agent: personName(row.agent.firstName, row.agent.lastName),
         createdAt: row.requestedAt,
       })),
+      payouts: payoutPage,
     };
   }
 
@@ -806,9 +1421,9 @@ export class PlatformService {
       verified: true,
       tillNumber: agent.tillNumber,
       agent: {
-        firstName: agent.firstName,
-        lastName: agent.lastName,
-        name: `${agent.firstName} ${agent.lastName}`.trim(),
+        firstName: normalizeName(agent.firstName),
+        lastName: normalizeName(agent.lastName),
+        name: personName(agent.firstName, agent.lastName),
       },
     };
   }
@@ -823,6 +1438,11 @@ export class PlatformService {
     }
     if (dto.amount < 1) {
       throw new BadRequestException('Amount must be greater than 0');
+    }
+    const idempotencyKey = this.cleanIdempotencyKey(dto.idempotencyKey);
+    if (idempotencyKey) {
+      const replay = await this.replayWithdrawal(user, idempotencyKey);
+      if (replay) return replay;
     }
 
     const till = this.normalizeTill(dto.tillNumber);
@@ -839,23 +1459,29 @@ export class PlatformService {
     }
 
     const terminal = await this.requireConductorTerminal(user);
+    const quote = await this.books.quoteWithdrawal(dto.amount);
     const available = await this.conductorAvailableBalance(user.id, terminal.id);
-    if (dto.amount > available) {
+    if (quote.totalDebit > available) {
       throw new BadRequestException(
-        `Insufficient balance. Available TZS ${available}`,
+        `Insufficient balance. Available TZS ${available}. Fee TZS ${quote.fee}. Total TZS ${quote.totalDebit}.`,
       );
     }
 
-    const withdrawal = await this.prisma.$transaction(async (tx) => {
-      // Re-check inside transaction to avoid double-spend races.
+    let withdrawal: {
+      created: { reference: string };
+      posted: { alreadyPosted?: boolean; balanceAfter: number };
+    };
+    try {
+    withdrawal = await this.prisma.$transaction(async (tx) => {
+      await lockConductorBalance(tx, user.id);
       const lockedAvailable = await this.conductorAvailableBalance(
         user.id,
         terminal.id,
         tx,
       );
-      if (dto.amount > lockedAvailable) {
+      if (quote.totalDebit > lockedAvailable) {
         throw new BadRequestException(
-          `Insufficient balance. Available TZS ${lockedAvailable}`,
+          `Insufficient balance. Available TZS ${lockedAvailable}. Fee TZS ${quote.fee}. Total TZS ${quote.totalDebit}.`,
         );
       }
 
@@ -865,43 +1491,98 @@ export class PlatformService {
           agentUserId: agent.id,
           conductorUserId: user.id,
           amount: dto.amount,
+          platformFee: quote.fee,
+          totalDebit: quote.totalDebit,
           status: WithdrawalStatus.PAID,
           notes: `Conductor cash-out via TILL ${agent.tillNumber ?? till}`,
           processedAt: new Date(),
         },
       });
 
-      await this.sms.enqueue(
-        user.phone,
-        'WALLET_REFUND',
-        `Umefanikiwa kutoa TZS ${dto.amount} kwa wakala ${agent.tillNumber ?? till}. Salio TZS ${lockedAvailable - dto.amount}. Kumb. ${created.reference}.`,
-        tx,
-      );
-      await this.sms.enqueue(
-        agent.phone,
-        'WALLET_REFUND',
-        `Malipo TZS ${dto.amount} kutoka kondakta ${user.firstName} ${user.lastName}. TILL ${agent.tillNumber ?? till}. Kumb. ${created.reference}.`,
-        tx,
-      );
+      const posted = await this.floats.record(tx, {
+        agentUserId: agent.id,
+        type: WakalaFloatTransactionType.CONDUCTOR_WITHDRAWAL,
+        amount: dto.amount,
+        reference: created.reference,
+        reason: `Conductor cash-out via TILL ${agent.tillNumber ?? till}`,
+        withdrawalId: created.id,
+      });
+      await this.books.postCashOut(tx, {
+        withdrawalId: created.id,
+        cashAmount: dto.amount,
+        fee: quote.fee,
+      });
 
-      return created;
+      await tx.auditLog.create({
+        data: {
+          actorUserId: user.id,
+          action: 'WITHDRAWAL_PAID',
+          entityType: 'Withdrawal',
+          entityId: created.id,
+          metadata: {
+            reference: created.reference,
+            amount: dto.amount,
+            agentUserId: agent.id,
+          },
+        },
+      });
+
+      if (idempotencyKey) {
+        await tx.apiIdempotency.create({
+          data: {
+            scope: `cashout:${user.id}`,
+            key: idempotencyKey,
+            entityType: 'Withdrawal',
+            entityId: created.id,
+          },
+        });
+      }
+
+      return { created, posted };
     });
+    } catch (error) {
+      if (idempotencyKey && this.isUniqueViolation(error)) {
+        const replay = await this.replayWithdrawal(user, idempotencyKey);
+        if (replay) return replay;
+      }
+      throw error;
+    }
+
+    if (!withdrawal.posted.alreadyPosted) {
+      try {
+        await queuePaidWithdrawalSms(this.sms, {
+          amount: dto.amount,
+          fee: quote.fee,
+          earningsBalance: available - quote.totalDebit,
+          reference: withdrawal.created.reference,
+          conductorPhone: user.phone,
+          wakalaPhone: agent.phone,
+          floatBalance: withdrawal.posted.balanceAfter,
+        });
+      } catch {
+        // Cash-out is already committed. The outbox retries delivery.
+      }
+    }
 
     void this.smsDispatcher.flush();
 
-    const nextAvailable = available - dto.amount;
+    const nextAvailable = available - quote.totalDebit;
     return {
       success: true,
       message: 'Withdrawal successful',
-      reference: withdrawal.reference,
+      reference: withdrawal.created.reference,
       amount: dto.amount,
+      fee: quote.fee,
+      platformFee: quote.fee,
+      netAmount: dto.amount,
+      totalDebit: quote.totalDebit,
       available: nextAvailable,
       smsQueued: true,
       agent: {
         tillNumber: agent.tillNumber,
-        firstName: agent.firstName,
-        lastName: agent.lastName,
-        name: `${agent.firstName} ${agent.lastName}`.trim(),
+        firstName: normalizeName(agent.firstName),
+        lastName: normalizeName(agent.lastName),
+        name: personName(agent.firstName, agent.lastName),
       },
     };
   }
@@ -916,11 +1597,64 @@ export class PlatformService {
         terminalId,
         status: TransactionStatus.SUCCESS,
       },
-      _sum: { amount: true },
+      _sum: { conductorShare: true, amount: true },
     });
-    const gross = taps._sum.amount ?? 0;
+    const gross =
+      taps._sum.conductorShare == null
+        ? (taps._sum.amount ?? 0)
+        : taps._sum.conductorShare;
     const withdrawn = await this.conductorWithdrawnTotal(conductorUserId, db);
-    return Math.max(0, gross - withdrawn);
+    const payouts = await db.conductorPayout.aggregate({
+      where: {
+        conductorUserId,
+        status: {
+          in: [
+            ConductorPayoutStatus.PENDING,
+            ConductorPayoutStatus.PROCESSING,
+            ConductorPayoutStatus.COMPLETED,
+          ],
+        },
+      },
+      _sum: { totalDebit: true, amount: true },
+    });
+    const reserved =
+      payouts._sum.totalDebit == null
+        ? (payouts._sum.amount ?? 0)
+        : payouts._sum.totalDebit;
+    return Math.max(0, gross - withdrawn - reserved);
+  }
+
+  private async conductorPayoutRows(
+    conductorUserId: string,
+    take = 20,
+    cursor?: Date,
+    since?: Date,
+  ) {
+    const requestedAt =
+      cursor || since
+        ? {
+            ...(since ? { gt: since } : {}),
+            ...(cursor ? { lt: cursor } : {}),
+          }
+        : undefined;
+    const rows = await this.prisma.conductorPayout.findMany({
+      where: { conductorUserId, ...(requestedAt ? { requestedAt } : {}) },
+      orderBy: { requestedAt: 'desc' },
+      take,
+    });
+    return rows.map((row) => ({
+      reference: row.reference,
+      amount: row.amount,
+      fee: row.platformFee,
+      platformFee: row.platformFee,
+      netAmount: row.amount,
+      totalDebit: row.totalDebit,
+      method: row.method,
+      provider: row.provider,
+      destination: maskDestination(row.method, row.destination),
+      status: row.status,
+      createdAt: row.requestedAt,
+    }));
   }
 
   private async conductorWithdrawnTotal(
@@ -938,9 +1672,11 @@ export class PlatformService {
           ],
         },
       },
-      _sum: { amount: true },
+      _sum: { totalDebit: true, amount: true },
     });
-    return rows._sum.amount ?? 0;
+    return rows._sum.totalDebit == null
+      ? (rows._sum.amount ?? 0)
+      : rows._sum.totalDebit;
   }
 
   private normalizeTill(value?: string): string | undefined {
@@ -1058,6 +1794,22 @@ export class PlatformService {
     throw new ConflictException('Could not allocate a terminal');
   }
 
+  private cardInclude() {
+    return {
+      wallet: {
+        include: { customer: true },
+      },
+    } as const;
+  }
+
+  private async cardByUid(nfcUid: string) {
+    const keys = nfcUidMatchKeys(nfcUid);
+    if (!keys.length) return null;
+    return this.prisma.card.findFirst({
+      where: { nfcUid: { in: keys } },
+    });
+  }
+
   private async findCard(serialNumber?: string, nfcUid?: string) {
     const serial = this.normalizeSerial(serialNumber);
     const uid = this.normalizeUid(nfcUid);
@@ -1065,32 +1817,38 @@ export class PlatformService {
       throw new BadRequestException('serialNumber or nfcUid is required');
     }
 
+    const include = this.cardInclude();
+
     // Prefer NFC UID — that is what the conductor phone actually reads.
-    const card = await this.prisma.card.findFirst({
-      where: uid ? { nfcUid: uid } : { serialNumber: serial },
-      include: {
-        wallet: {
-          include: { customer: true },
-        },
-      },
-    });
-    if (!card) {
-      if (uid && serial) {
-        const bySerial = await this.prisma.card.findFirst({
-          where: { serialNumber: serial },
-          include: {
-            wallet: {
-              include: { customer: true },
-            },
-          },
-        });
-        if (bySerial) {
-          return bySerial;
-        }
-      }
-      throw new NotFoundException('Card not found');
+    // A lost UID must resolve to the lost physical card, not the new one.
+    if (uid) {
+      const byUid = await this.prisma.card.findFirst({
+        where: { nfcUid: { in: nfcUidMatchKeys(nfcUid) } },
+        include,
+      });
+      if (byUid) return byUid;
+      if (!serial) throw new NotFoundException('Card not found');
     }
-    return card;
+
+    if (!serial) throw new NotFoundException('Card not found');
+
+    const live = await this.prisma.card.findFirst({
+      where: {
+        serialNumber: serial,
+        status: { in: [CardStatus.ACTIVE, CardStatus.FROZEN] },
+      },
+      include,
+      orderBy: { issuedAt: 'desc' },
+    });
+    if (live) return live;
+
+    const historical = await this.prisma.card.findFirst({
+      where: { serialNumber: serial },
+      include,
+      orderBy: { issuedAt: 'desc' },
+    });
+    if (!historical) throw new NotFoundException('Card not found');
+    return historical;
   }
 
   private async findWalletByPhone(phone?: string) {
@@ -1133,8 +1891,7 @@ export class PlatformService {
   }
 
   private normalizeUid(value?: string): string | undefined {
-    const uid = value?.replace(/\s+/g, '').toUpperCase();
-    return uid ? uid : undefined;
+    return normalizeNfcUid(value);
   }
 
   private cardView(
@@ -1165,8 +1922,8 @@ export class PlatformService {
         status: wallet.status,
       },
       customer: {
-        firstName: customer?.firstName ?? '',
-        lastName: customer?.lastName ?? '',
+        firstName: customer?.firstName ? normalizeName(customer.firstName) : '',
+        lastName: customer?.lastName ? normalizeName(customer.lastName) : '',
         phone: customer?.phone ?? '',
       },
     };
@@ -1214,25 +1971,11 @@ export class PlatformService {
     throw new ConflictException('Could not generate a customer id');
   }
 
-  private async uniqueCode(prefix: 'BP' | 'WAL'): Promise<string> {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const code = `${prefix}-${String(randomInt(100000000, 1000000000))}`;
-      const taken =
-        prefix === 'BP'
-          ? await this.prisma.card.findUnique({ where: { serialNumber: code } })
-          : await this.prisma.wallet.findUnique({ where: { publicCode: code } });
-      if (!taken) {
-        return code;
-      }
-    }
-    throw new ConflictException('Could not generate a unique code');
-  }
-
   /** 12-digit public card number for display / top-up (not NFC UID). */
   private async uniqueCardNumber(): Promise<string> {
     for (let attempt = 0; attempt < 12; attempt += 1) {
       const serialNumber = String(randomInt(100000000000, 1000000000000));
-      const taken = await this.prisma.card.findUnique({
+      const taken = await this.prisma.card.findFirst({
         where: { serialNumber },
       });
       if (!taken) {

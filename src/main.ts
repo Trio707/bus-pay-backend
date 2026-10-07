@@ -5,6 +5,8 @@ import { NestFactory } from '@nestjs/core';
 import { networkInterfaces } from 'node:os';
 
 import { AppModule } from './app.module';
+import { gzipJsonResponses } from './http/gzip-json';
+import { privateApiCache } from './http/private-cache';
 
 function lanAddresses(port: number): string[] {
   const urls = [`http://127.0.0.1:${port}`];
@@ -24,6 +26,8 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
   app.enableCors();
+  app.use(privateApiCache);
+  app.use(gzipJsonResponses);
 
   app.useGlobalPipes(
     new ValidationPipe({

@@ -64,9 +64,11 @@ describe('AdminService', () => {
         aggregate: jest.fn().mockResolvedValue({ _sum: { amount: 0 }, _count: 0 }),
       },
     };
-    service = new AdminService(prisma as never, {
-      enqueue: jest.fn(),
-    } as never);
+    service = new AdminService(
+      prisma as never,
+      { enqueue: jest.fn() } as never,
+      { getBalance: jest.fn(), record: jest.fn() } as never,
+    );
   });
 
   it('lists users with pagination', async () => {

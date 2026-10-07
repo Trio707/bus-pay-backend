@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  IsEmail,
   IsIn,
   IsInt,
   IsNotEmpty,
@@ -12,6 +13,8 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+
+import { EmailField } from '../../auth/email';
 
 import {
   NIDA_MESSAGE,
@@ -49,7 +52,7 @@ export class PaginationQueryDto {
 
 export class ListUsersQueryDto extends PaginationQueryDto {
   @IsOptional()
-  @IsIn([UserRole.ADMIN, UserRole.AGENT, UserRole.CONDUCTOR])
+  @IsIn([UserRole.ADMIN, UserRole.AGENT, UserRole.CONDUCTOR, UserRole.MASTER_AGENT])
   role?: UserRole;
 
   @IsOptional()
@@ -327,6 +330,21 @@ export class UpdateSettingsDto {
   settlementFeeBps?: string;
 }
 
+export class FundWakalaFloatDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  amount: number;
+
+  @IsOptional()
+  @IsString()
+  reason?: string;
+
+  @IsOptional()
+  @IsString()
+  reference?: string;
+}
+
 export class ListRefundsQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsString()
@@ -339,4 +357,62 @@ export class ListRefundsQueryDto extends PaginationQueryDto {
   @IsOptional()
   @IsString()
   to?: string;
+}
+
+export class CreateMasterWakalaDto {
+  @IsString()
+  @IsNotEmpty()
+  firstName: string;
+
+  @IsString()
+  @IsNotEmpty()
+  lastName: string;
+
+  @EmailField()
+  @IsEmail({}, { message: 'Use a valid email' })
+  email: string;
+
+  @PhoneField()
+  @IsString()
+  @Matches(TZ_PHONE_PATTERN, { message: TZ_PHONE_MESSAGE })
+  phone: string;
+
+  @NidaField()
+  @IsString()
+  @Matches(NIDA_PATTERN, { message: NIDA_MESSAGE })
+  nida: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  permissions?: string[];
+}
+
+export class UpdateMasterWakalaDto {
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  firstName?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  lastName?: string;
+
+  @IsOptional()
+  @EmailField()
+  @IsEmail({}, { message: 'Use a valid email' })
+  email?: string;
+
+  @IsOptional()
+  @PhoneField()
+  @IsString()
+  @Matches(TZ_PHONE_PATTERN, { message: TZ_PHONE_MESSAGE })
+  phone?: string;
+}
+
+export class SetMasterPermissionsDto {
+  @IsArray()
+  @IsString({ each: true })
+  permissions: string[];
 }
